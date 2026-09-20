@@ -11,9 +11,9 @@ thermal limits terminate control and restore the iDRAC automatic policy.
 The systemd unit also restores automatic mode after crashes or watchdog expiry.
 Neither mechanism can protect against a frozen kernel or an unreachable BMC.
 
-The 45% floor is a conservative local trial setting, not a Dell airflow
-certification. H330 and X540 temperatures are not exposed on this host.
-Do not lower it based solely on CPU or disk temperatures.
+The balanced profile preserves the original 45% floor. Silent and quiet are
+unvalidated low-airflow presets: H330 and X540 temperatures are not exposed.
+Profile selection persists locally; runtime switching needs no service restart.
 """
 
 import argparse
@@ -26,6 +26,11 @@ import glob
 import json
 import signal
 import socket
+import contextlib
+import fcntl
+import select
+import stat
+import tempfile
 from datetime import datetime
 
 # Local OpenIPMI needs no network session or iDRAC password.
@@ -51,7 +56,7 @@ def fan_enable_manual():
 
 def fan_set_percent(percent):
     """Set all fans; never silently accept an unvalidated duty."""
-    if not FAN_FLOOR <= percent <= FAN_CEILING:
+    if not MIN_FAN_PERCENT <= percent <= MAX_FAN_PERCENT:
         raise ValueError(f"PWM outside configured range: {percent}")
     subprocess.run(IPMI_CMD + ["raw", "0x30", "0x30", "0x02", "0xff", hex(percent)],
                    capture_output=True, check=True, timeout=5)
@@ -63,8 +68,18 @@ def fan_restore_auto():
 
 
 # Each component demands a PWM independently; the highest demand wins.
-FAN_FLOOR = 45
-FAN_CEILING = 75
+FAN_PROFILES = {
+    "silent": (10, 75),
+    "quiet": (25, 75),
+    "balanced": (45, 75),
+    "performance": (65, 100),
+    "full-speed": (100, 100),
+}
+DEFAULT_PROFILE = "balanced"
+MIN_FAN_PERCENT = min(bounds[0] for bounds in FAN_PROFILES.values())
+MAX_FAN_PERCENT = max(bounds[1] for bounds in FAN_PROFILES.values())
+CONTROL_SOCKET = "/run/ipmi-fan-control/control.sock"
+PROFILE_STATE_FILE = "/var/lib/ipmi-fan-control/profile"
 HYSTERESIS = 2
 RAMP_DOWN_MAX = 2
 CYCLE_SECONDS = 15
@@ -97,25 +112,25 @@ def lerp(value, in_low, in_high, out_low, out_high):
     return out_low + ratio * (out_high - out_low)
 
 
-def compute_fan_target(inlet, cpu_max, exhaust):
-    return max(component_target(value, AIR_PROFILES[name], name)
+def compute_fan_target(inlet, cpu_max, exhaust, profile):
+    return max(component_target(value, AIR_PROFILES[name], name, profile)
                for name, value in (("inlet", inlet), ("cpu", cpu_max),
                                    ("exhaust", exhaust)))
 
 
-def component_target(temperature, limits, name):
+def component_target(temperature, limits, name, profile):
     low, high = limits
     if temperature >= high:
         raise SensorError(f"{name} reached the automatic-control limit: "
                           f"{temperature:g}C >= {high}C")
-    return lerp(temperature, low, high, FAN_FLOOR, FAN_CEILING)
+    return lerp(temperature, low, high, *FAN_PROFILES[profile])
 
 
-def apply_ramping(current, target):
+def apply_ramping(current, target, allow_decrease=True):
     target = math.ceil(target)
     if current is None or target >= current:
         return target
-    if current - target < HYSTERESIS:
+    if not allow_decrease or current - target < HYSTERESIS:
         return current
     return max(target, current - RAMP_DOWN_MAX)
 
@@ -296,9 +311,122 @@ def summarize_drive_temperatures(entries):
 
 
 
-def compute_drive_fan_target(summary):
-    return max(component_target(temp, DRIVE_PROFILES[profile], profile)
-               for profile, temp in summary["max_by_profile"].items())
+def compute_drive_fan_target(summary, profile):
+    return max(component_target(temp, DRIVE_PROFILES[kind], kind, profile)
+               for kind, temp in summary["max_by_profile"].items())
+
+
+def private_directory(path, create=False):
+    directory = os.path.dirname(os.path.abspath(path))
+    if create:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    info = os.stat(directory)
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise PermissionError(f"Directory must be owned by this user and private: {directory}")
+    return directory
+
+
+def read_profile(path):
+    try:
+        private_directory(path)
+        with open(path) as state:
+            profile = state.read(64).strip()
+    except FileNotFoundError:
+        return None
+    if profile not in FAN_PROFILES:
+        raise ValueError(f"Invalid saved profile in {path}: {profile!r}")
+    return profile
+
+
+def save_profile(path, profile):
+    directory = private_directory(path, create=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".profile-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w") as state:
+            state.write(profile + "\n")
+            state.flush()
+            os.fsync(state.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@contextlib.contextmanager
+def control_socket(path):
+    private_directory(path, create=True)
+    # Keep ownership through automatic restoration; never unlink a live socket.
+    with open(path + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISSOCK(info.st_mode):
+                raise ValueError(f"Refusing to remove a non-socket file: {path}")
+            os.unlink(path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+            listener.bind(path)
+            try:
+                os.chmod(path, 0o600)
+                listener.listen(4)
+                yield listener
+            finally:
+                os.unlink(path)
+
+
+def reply_profile(connection, response):
+    with connection:
+        try:
+            connection.sendall(json.dumps(response).encode())
+        except OSError:
+            # A disconnected CLI must not stop cooling or undo an applied choice.
+            pass
+
+
+def wait_for_profile(listener, timeout, status):
+    until = time.monotonic() + timeout
+    # An overrun leaves no idle time, but queued commands still need one poll.
+    first_poll = True
+    while first_poll or time.monotonic() < until:
+        first_poll = False
+        ready, _, _ = select.select([listener], [], [], max(0, until - time.monotonic()))
+        if not ready:
+            break
+        connection, _ = listener.accept()
+        connection.settimeout(1)
+        try:
+            request = json.loads(connection.recv(1024))
+            if not isinstance(request, dict):
+                raise ValueError("Expected a profile command object")
+            command = request.get("command")
+            if command == "get":
+                reply_profile(connection, status)
+                continue
+            profile = request.get("profile")
+            if command != "set" or not isinstance(profile, str) or profile not in FAN_PROFILES:
+                raise ValueError("Unknown profile command or profile name")
+            if profile == status["profile"]:
+                reply_profile(connection, status)
+                continue
+            return connection, profile
+        except (OSError, ValueError) as error:
+            reply_profile(connection, {"error": str(error)})
+    return None
+
+
+def request_profile(path, profile):
+    request = {"command": "get"} if profile is None else {"command": "set", "profile": profile}
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+        # The main loop may be finishing a SMART sweep; never interrupt its checks.
+        connection.settimeout(120)
+        connection.connect(path)
+        connection.sendall(json.dumps(request).encode())
+        response = json.loads(connection.recv(4096))
+    if "error" in response:
+        raise RuntimeError(response["error"])
+    return response
 
 
 def main():
@@ -307,59 +435,121 @@ def main():
     mode.add_argument("--check", action="store_true", help="one read-only sample (default)")
     mode.add_argument("--control", action="store_true", help="enable manual PWM control")
     mode.add_argument("--monitor", action="store_true", help="repeat read-only samples")
+    mode.add_argument("--list-profiles", action="store_true", help="list presets without hardware access")
+    mode.add_argument("--get-profile", action="store_true", help="query the running controller")
+    mode.add_argument("--set-profile", choices=FAN_PROFILES, help="switch and persist the running profile")
+    parser.add_argument("--profile", choices=FAN_PROFILES,
+                        help="startup override; otherwise saved profile, then balanced")
+    parser.add_argument("--socket", default=CONTROL_SOCKET, help="local control socket path")
+    parser.add_argument("--state-file", default=PROFILE_STATE_FILE, help="controller profile state path")
     parser.add_argument("--duration", type=float, help="stop after this many seconds")
     args = parser.parse_args()
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
         parser.error("--duration must be finite and positive")
+    client_mode = args.list_profiles or args.get_profile or args.set_profile is not None
+    if client_mode and (args.profile is not None or args.duration is not None):
+        parser.error("--profile and --duration apply only to sampling/control modes")
+    if args.list_profiles:
+        print(json.dumps({"default": DEFAULT_PROFILE, "profiles": {
+            name: {"floor": low, "ceiling": high}
+            for name, (low, high) in FAN_PROFILES.items()
+        }}))
+        return 0
+    if args.get_profile or args.set_profile is not None:
+        try:
+            print(json.dumps(request_profile(args.socket, args.set_profile)))
+            return 0
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"[ERROR] Profile request failed: {error}", file=sys.stderr, flush=True)
+            return 1
 
     def stop(signum, frame):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    resources = contextlib.ExitStack()
+    listener = None
+    try:
+        if args.control:
+            listener = resources.enter_context(control_socket(args.socket))
+    except Exception as error:
+        resources.close()
+        print(f"[ERROR] Cannot own control socket: {error}", file=sys.stderr, flush=True)
+        # A competing controller must not restore auto underneath the owner.
+        return 1
+
     deadline = time.monotonic() + args.duration if args.duration is not None else None
     current_fan = None
+    next_cycle = 0
+    next_decrease = 0
     last_sample = None
     drive_summary = None
+    pending = None
+    failure = "Controller stopped before the profile switch completed"
     exit_code = 0
     try:
+        saved_profile = read_profile(args.state_file) if args.profile is None else None
+        profile = args.profile or saved_profile or DEFAULT_PROFILE
         while deadline is None or time.monotonic() < deadline:
             cycle_start = time.monotonic()
+            if cycle_start >= next_cycle:
+                next_cycle = cycle_start + CYCLE_SECONDS
             # Never enter manual mode before the first complete valid sample.
             if last_sample is None or cycle_start - last_sample >= DRIVE_SAMPLE_SECONDS:
                 drive_summary = sample_drive_temperatures()
                 last_sample = cycle_start
             inlet, exhaust, temp1, temp2 = read_all_sensors()
-            target = max(compute_fan_target(inlet, max(temp1, temp2), exhaust),
-                         compute_drive_fan_target(drive_summary))
-            requested_fan = apply_ramping(current_fan, target)
+            target = max(compute_fan_target(inlet, max(temp1, temp2), exhaust, profile),
+                         compute_drive_fan_target(drive_summary, profile))
+            requested_fan = apply_ramping(current_fan, target, cycle_start >= next_decrease)
             if args.control and requested_fan != current_fan:
                 if current_fan is None:
                     fan_enable_manual()
                 fan_set_percent(requested_fan)
+                if current_fan is None or requested_fan < current_fan:
+                    # Repeated CLI requests cannot accelerate downward ramping.
+                    next_decrease = time.monotonic() + CYCLE_SECONDS
                 current_fan = requested_fan
+            if args.control and profile != saved_profile:
+                save_profile(args.state_file, profile)
+                saved_profile = profile
+            status = {"profile": profile, "pwm": current_fan,
+                      "profile_target_pwm": math.ceil(target)}
             print(json.dumps({
                 "time": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "mode": "manual" if args.control else "monitor",
-                "pwm": current_fan, "target_pwm": requested_fan,
+                **status, "target_pwm": requested_fan,
                 "inlet": inlet, "exhaust": exhaust, "cpu": [temp1, temp2],
                 "fan_rpm": LAST_FAN_RPMS,
                 "drive_age_seconds": round(time.monotonic() - last_sample, 1),
                 "drives": drive_summary,
             }), flush=True)
             notify_watchdog()
+            if pending is not None:
+                reply_profile(pending, status)
+                pending = None
             if not args.control and not args.monitor:
                 break
-            wait = max(0, CYCLE_SECONDS - (time.monotonic() - cycle_start))
+            wait = max(0, next_cycle - time.monotonic())
             if deadline is not None:
                 wait = min(wait, max(0, deadline - time.monotonic()))
-            time.sleep(wait)
+            if listener is None:
+                time.sleep(wait)
+            else:
+                request = wait_for_profile(listener, wait, status)
+                if request is not None:
+                    pending, profile = request
     except KeyboardInterrupt:
         pass
     except Exception as error:
+        failure = str(error)
         print(f"[ERROR] {error}", file=sys.stderr, flush=True)
         exit_code = 1
     finally:
+        # Repeated stop requests must not interrupt the bounded restore attempt.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         if args.control:
             try:
                 fan_restore_auto()
@@ -368,6 +558,9 @@ def main():
                 print(f"[CRITICAL] Automatic control restore failed: {error}",
                       file=sys.stderr, flush=True)
                 exit_code = 1
+        if pending is not None:
+            reply_profile(pending, {"error": failure})
+        resources.close()
     return exit_code
 
 

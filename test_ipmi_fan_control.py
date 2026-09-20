@@ -4,7 +4,10 @@ import io
 import signal
 import subprocess
 import sys
+import socket
 import unittest
+import tempfile
+from pathlib import Path
 from unittest import mock
 
 import ipmi_fan_control as controller
@@ -94,13 +97,181 @@ class FanControlTests(unittest.TestCase):
         def interrupted_sample():
             handlers[signal.SIGTERM](signal.SIGTERM, None)
         with (
-            mock.patch.object(sys, 'argv', ['fan-control', '--control']),
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(sys, 'argv', ['fan-control', '--control',
+                                           '--socket', directory + '/control.sock',
+                                           '--state-file', directory + '/profile']),
             mock.patch.object(controller.signal, 'signal', side_effect=handlers.__setitem__),
             mock.patch.object(controller, 'sample_drive_temperatures', side_effect=interrupted_sample),
             mock.patch.object(controller, 'fan_restore_auto', side_effect=OSError('BMC unavailable')),
             contextlib.redirect_stderr(io.StringIO()),
         ):
             self.assertEqual(controller.main(), 1)
+
+
+class ProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.resources = contextlib.ExitStack()
+        self.addCleanup(self.resources.close)
+        self.directory = Path(self.resources.enter_context(tempfile.TemporaryDirectory()))
+        self.state = self.directory / 'profile'
+        self.endpoint = str(self.directory / 'control.sock')
+        self.automatic = True
+        self.pwm_writes = []
+        self.resources.enter_context(mock.patch.object(
+            controller.subprocess, 'run', side_effect=self.fake_ipmi))
+        self.resources.enter_context(mock.patch.object(controller.signal, 'signal'))
+        self.resources.enter_context(mock.patch.object(controller, 'notify_watchdog'))
+        self.resources.enter_context(mock.patch.object(controller, 'read_all_sensors',
+                                                       return_value=(23, 34, 42, 45)))
+        self.resources.enter_context(mock.patch.object(controller, 'sample_drive_temperatures',
+            return_value={'max_by_profile': {'hdd': 30, 'ssd': 35, 'nvme': 36}}))
+        self.resources.enter_context(mock.patch.object(sys, 'argv', [
+            'fan-control', '--control', '--socket', self.endpoint,
+            '--state-file', str(self.state)]))
+        self.resources.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.resources.enter_context(contextlib.redirect_stderr(io.StringIO()))
+
+    def fake_ipmi(self, command, **kwargs):
+        prefix = controller.IPMI_CMD + ['raw', '0x30', '0x30']
+        if command == prefix + ['0x01', '0x00']:
+            self.automatic = False
+        elif command == prefix + ['0x01', '0x01']:
+            self.automatic = True
+        elif command[:-1] == prefix + ['0x02', '0xff']:
+            self.pwm_writes.append(int(command[-1], 16))
+        else:
+            raise AssertionError(f'Unexpected command: {command}')
+        return subprocess.CompletedProcess(command, 0, '', '')
+
+    def test_profiles_request_distinct_duties_for_the_same_cpu_load(self):
+        for profile, expected in {'silent': 42.5, 'quiet': 50, 'balanced': 60,
+                                  'performance': 82.5, 'full-speed': 100}.items():
+            with self.subTest(profile=profile):
+                self.assertEqual(controller.compute_fan_target(23, 60, 34, profile), expected)
+
+    def test_extreme_profiles_do_not_bypass_air_or_disk_handoff(self):
+        for profile in ('silent', 'full-speed'):
+            with self.subTest(profile=profile):
+                with self.assertRaises(controller.SensorError):
+                    controller.compute_fan_target(23, 70, 34, profile)
+                with self.assertRaises(controller.SensorError):
+                    controller.compute_drive_fan_target({'max_by_profile': {'hdd': 45}}, profile)
+
+    def test_failed_state_replacement_preserves_previous_selection(self):
+        controller.save_profile(str(self.state), 'balanced')
+        with mock.patch.object(controller.os, 'replace', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                controller.save_profile(str(self.state), 'silent')
+        self.assertEqual(controller.read_profile(str(self.state)), 'balanced')
+
+    def test_corrupt_saved_profile_prevents_manual_control(self):
+        self.state.write_text('unknown\n')
+        self.assertEqual(controller.main(), 1)
+        self.assertTrue(self.automatic)
+        self.assertEqual(self.pwm_writes, [])
+        self.assertEqual(self.state.read_text(), 'unknown\n')
+
+    def test_failed_persistence_restores_automatic_control(self):
+        with mock.patch.object(controller, 'save_profile', side_effect=OSError('disk full')):
+            self.assertEqual(controller.main(), 1)
+        self.assertTrue(self.automatic)
+        self.assertFalse(self.state.exists())
+
+    def test_repeated_stop_signals_do_not_interrupt_automatic_restoration(self):
+        handlers = {}
+
+        def stopping_ipmi(command, **kwargs):
+            if command == controller.IPMI_CMD + ['raw', '0x30', '0x30', '0x01', '0x01']:
+                for signum in (signal.SIGTERM, signal.SIGINT):
+                    handler = handlers[signum]
+                    if handler == signal.SIG_DFL:
+                        raise SystemExit(128 + signum)
+                    if handler != signal.SIG_IGN:
+                        handler(signum, None)
+            return self.fake_ipmi(command, **kwargs)
+
+        with (
+            mock.patch.object(controller.signal, 'signal', side_effect=handlers.__setitem__),
+            mock.patch.object(controller.subprocess, 'run', side_effect=stopping_ipmi),
+            mock.patch.object(controller, 'wait_for_profile', side_effect=KeyboardInterrupt),
+        ):
+            self.assertEqual(controller.main(), 0)
+        self.assertTrue(self.automatic)
+        self.assertEqual(self.pwm_writes, [45])
+
+
+    def test_second_controller_does_not_restore_underneath_socket_owner(self):
+        self.automatic = False
+        with controller.control_socket(self.endpoint):
+            self.assertEqual(controller.main(), 1)
+            self.assertFalse(self.automatic)
+            self.assertEqual(self.pwm_writes, [])
+
+    def test_overrunning_cycles_still_process_queued_profile_commands(self):
+        now = [100]
+        samples = [0]
+        peer = self.resources.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
+
+        def slow_sensors():
+            samples[0] += 1
+            if samples[0] > 2:
+                raise KeyboardInterrupt
+            now[0] += controller.CYCLE_SECONDS + 1
+            if samples[0] == 1:
+                peer.connect(self.endpoint)
+                peer.sendall(b'{"command":"set","profile":"performance"}')
+            return 23, 34, 42, 45
+
+        with (
+            mock.patch.object(controller.time, 'monotonic', side_effect=lambda: now[0]),
+            mock.patch.object(controller, 'read_all_sensors', side_effect=slow_sensors),
+        ):
+            self.assertEqual(controller.main(), 0)
+        self.assertEqual(self.pwm_writes, [45, 65])
+        self.assertEqual(controller.read_profile(str(self.state)), 'performance')
+
+    def test_repeated_switches_cannot_accelerate_downward_ramping(self):
+        now = [100]
+        actions = iter([(101, 'full-speed'), (102, 'silent'), (103, 'quiet'),
+                        (115, 'balanced'), (116, 'silent')])
+
+        def switch(listener, timeout, status):
+            try:
+                now[0], profile = next(actions)
+            except StopIteration:
+                raise KeyboardInterrupt
+            connection, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            self.resources.enter_context(peer)
+            return connection, profile
+
+        with (
+            mock.patch.object(controller.time, 'monotonic', side_effect=lambda: now[0]),
+            mock.patch.object(controller, 'wait_for_profile', side_effect=switch),
+        ):
+            self.assertEqual(controller.main(), 0)
+        self.assertEqual(self.pwm_writes, [45, 100, 98])
+        self.assertEqual(controller.read_profile(str(self.state)), 'silent')
+        self.assertTrue(self.automatic)
+
+    def test_restart_loads_saved_profile_and_explicit_override_replaces_it(self):
+        controller.save_profile(str(self.state), 'performance')
+        with mock.patch.object(controller, 'wait_for_profile', side_effect=KeyboardInterrupt):
+            self.assertEqual(controller.main(), 0)
+            with mock.patch.object(sys, 'argv', sys.argv + ['--profile', 'balanced']):
+                self.assertEqual(controller.main(), 0)
+        self.assertEqual(self.pwm_writes, [65, 45])
+        self.assertEqual(controller.read_profile(str(self.state)), 'balanced')
+        self.assertTrue(self.automatic)
+
+    def test_read_only_profile_override_does_not_change_saved_selection(self):
+        controller.save_profile(str(self.state), 'performance')
+        with mock.patch.object(sys, 'argv', ['fan-control', '--check', '--profile', 'silent',
+                                           '--state-file', str(self.state)]):
+            self.assertEqual(controller.main(), 0)
+        self.assertEqual(controller.read_profile(str(self.state)), 'performance')
+        self.assertTrue(self.automatic)
+        self.assertEqual(self.pwm_writes, [])
 
 
 if __name__ == '__main__':

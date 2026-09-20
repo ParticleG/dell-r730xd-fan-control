@@ -4,6 +4,11 @@ After=systemd-modules-load.service openipmi.service
 
 [Service]
 Type=simple
+RuntimeDirectory=ipmi-fan-control
+RuntimeDirectoryMode=0700
+StateDirectory=ipmi-fan-control
+StateDirectoryMode=0700
+UMask=0077
 ExecStart=/usr/bin/python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --control
 ExecStopPost=/usr/bin/timeout --kill-after=2s 10s /usr/bin/ipmitool -I open raw 0x30 0x30 0x01 0x01
 NotifyAccess=main
