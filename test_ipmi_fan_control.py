@@ -250,8 +250,64 @@ class ProfileTests(unittest.TestCase):
             mock.patch.object(controller, 'wait_for_profile', side_effect=switch),
         ):
             self.assertEqual(controller.main(), 0)
-        self.assertEqual(self.pwm_writes, [45, 100, 98])
+        self.assertEqual(self.pwm_writes, [45, 100, 90])
         self.assertEqual(controller.read_profile(str(self.state)), 'silent')
+        self.assertTrue(self.automatic)
+
+    def test_switch_finishes_at_target_then_restores_normal_ramping(self):
+        now = [100]
+        cpu = [45]
+        actions = iter([(101, 'silent', 51), (115, None, 51), (130, None, 51),
+                        (145, None, 51), (160, None, 51), (175, None, 50)])
+
+        def advance(listener, timeout, status):
+            try:
+                now[0], profile, cpu[0] = next(actions)
+            except StopIteration:
+                raise KeyboardInterrupt
+            if profile is None:
+                return None
+            connection, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            self.resources.enter_context(peer)
+            return connection, profile
+
+        with (
+            mock.patch.object(controller.time, 'monotonic', side_effect=lambda: now[0]),
+            mock.patch.object(controller, 'read_all_sensors',
+                              side_effect=lambda: (23, 34, 42, cpu[0])),
+            mock.patch.object(controller, 'wait_for_profile', side_effect=advance),
+        ):
+            self.assertEqual(controller.main(), 0)
+        # The final one-point switch step must not stick in normal hysteresis.
+        # A later temperature-driven target of 10 resumes two-point reductions.
+        self.assertEqual(self.pwm_writes, [45, 35, 25, 15, 14, 12])
+        self.assertEqual(controller.read_profile(str(self.state)), 'silent')
+        self.assertTrue(self.automatic)
+
+    def test_sensor_failure_during_fast_transition_restores_automatic_control(self):
+        now = [100]
+        actions = iter([(101, 'silent'), (115, None), (130, None)])
+
+        def advance(listener, timeout, status):
+            now[0], profile = next(actions)
+            if profile is None:
+                return None
+            connection, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            self.resources.enter_context(peer)
+            return connection, profile
+
+        def sensors():
+            if now[0] >= 130:
+                raise controller.SensorError('Required fan became unhealthy')
+            return 23, 34, 42, 45
+
+        with (
+            mock.patch.object(controller.time, 'monotonic', side_effect=lambda: now[0]),
+            mock.patch.object(controller, 'read_all_sensors', side_effect=sensors),
+            mock.patch.object(controller, 'wait_for_profile', side_effect=advance),
+        ):
+            self.assertEqual(controller.main(), 1)
+        self.assertEqual(self.pwm_writes, [45, 35])
         self.assertTrue(self.automatic)
 
     def test_restart_loads_saved_profile_and_explicit_override_replaces_it(self):

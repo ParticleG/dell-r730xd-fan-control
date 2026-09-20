@@ -82,6 +82,7 @@ CONTROL_SOCKET = "/run/ipmi-fan-control/control.sock"
 PROFILE_STATE_FILE = "/var/lib/ipmi-fan-control/profile"
 HYSTERESIS = 2
 RAMP_DOWN_MAX = 2
+SWITCH_RAMP_DOWN_MAX = 10
 CYCLE_SECONDS = 15
 DRIVE_SAMPLE_SECONDS = 60
 DRIVE_SMART_TIMEOUT = 5
@@ -126,11 +127,15 @@ def component_target(temperature, limits, name, profile):
     return lerp(temperature, low, high, *FAN_PROFILES[profile])
 
 
-def apply_ramping(current, target, allow_decrease=True):
+def apply_ramping(current, target, allow_decrease=True, switching=False):
     target = math.ceil(target)
     if current is None or target >= current:
         return target
-    if not allow_decrease or current - target < HYSTERESIS:
+    if not allow_decrease:
+        return current
+    if switching:
+        return max(target, current - SWITCH_RAMP_DOWN_MAX)
+    if current - target < HYSTERESIS:
         return current
     return max(target, current - RAMP_DOWN_MAX)
 
@@ -486,6 +491,7 @@ def main():
     last_sample = None
     drive_summary = None
     pending = None
+    switching = False
     failure = "Controller stopped before the profile switch completed"
     exit_code = 0
     try:
@@ -493,7 +499,8 @@ def main():
         profile = args.profile or saved_profile or DEFAULT_PROFILE
         while deadline is None or time.monotonic() < deadline:
             cycle_start = time.monotonic()
-            if cycle_start >= next_cycle:
+            normal_cycle = cycle_start >= next_cycle
+            if normal_cycle:
                 next_cycle = cycle_start + CYCLE_SECONDS
             # Never enter manual mode before the first complete valid sample.
             if last_sample is None or cycle_start - last_sample >= DRIVE_SAMPLE_SECONDS:
@@ -502,15 +509,18 @@ def main():
             inlet, exhaust, temp1, temp2 = read_all_sensors()
             target = max(compute_fan_target(inlet, max(temp1, temp2), exhaust, profile),
                          compute_drive_fan_target(drive_summary, profile))
-            requested_fan = apply_ramping(current_fan, target, cycle_start >= next_decrease)
+            allow_decrease = normal_cycle if switching else cycle_start >= next_decrease
+            requested_fan = apply_ramping(current_fan, target, allow_decrease, switching)
             if args.control and requested_fan != current_fan:
                 if current_fan is None:
                     fan_enable_manual()
                 fan_set_percent(requested_fan)
                 if current_fan is None or requested_fan < current_fan:
-                    # Repeated CLI requests cannot accelerate downward ramping.
+                    # Ordinary temperature-driven reductions retain their cooldown.
                     next_decrease = time.monotonic() + CYCLE_SECONDS
                 current_fan = requested_fan
+            if switching and current_fan == math.ceil(target):
+                switching = False
             if args.control and profile != saved_profile:
                 save_profile(args.state_file, profile)
                 saved_profile = profile
@@ -540,6 +550,7 @@ def main():
                 request = wait_for_profile(listener, wait, status)
                 if request is not None:
                     pending, profile = request
+                    switching = True
     except KeyboardInterrupt:
         pass
     except Exception as error:

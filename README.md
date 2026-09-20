@@ -59,11 +59,14 @@ python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --set-profile balanced
 
 - A changed selection wakes the control loop without restarting the process. The loop completes any in-progress SMART/IPMI operation and performs a control cycle before acknowledging the change. Existing SMART sampling/cache rules are retained. Switching is not a hard-real-time operation; the CLI waits up to 120 seconds.
 - A successful response includes `profile`, `pwm` (last commanded duty) and `profile_target_pwm` (the temperature curve's demand before downward ramping). `--get-profile` returns the last completed cycle, not a new hardware measurement. Selecting the already active profile returns that status without another sample or state write.
-- Increases are immediate once the control cycle succeeds. Decreases remain limited to two percentage points per 15 seconds, including across repeated switch commands. Switching to a lower ceiling does **not** abruptly clamp the current duty to it; duty can temporarily exceed the new ceiling while ramping down.
+- Increases are immediate once the control cycle succeeds. A changed profile starts a temporary fast downward transition: at most **10 percentage points per normal control cycle** (nominally 15 seconds). Extra command-triggered cycles cannot take downward steps or reset that schedule. Switching to a lower ceiling does **not** abruptly clamp the current duty to it.
+- Every transition step uses the current temperature-derived demand, not simply the preset floor. Once the rounded-up target is reached, ordinary temperature-driven decreases resume their two-point limit, existing cooldown and hysteresis. The last transition step may be smaller than two points so it can finish at the target instead of getting stuck just above it. Reselecting the active profile does not restart a transition.
 - The controller atomically saves the selected name in `/var/lib/ipmi-fan-control/profile` after the successful cycle. It is reused after service or machine restarts. A save failure is an error and triggers automatic-control recovery rather than reporting a successful switch.
 - Startup selection order is explicit `--profile NAME`, then the saved name, then `balanced`. In control mode an explicit startup override is saved after its first successful cycle. A corrupt saved name prevents manual control; a deliberate `--profile balanced` override can replace it. Read-only `--check`/`--monitor` never save their selections.
 - The default endpoint is `/run/ipmi-fan-control/control.sock`, accessible only to root under the supplied service. The endpoint lock prevents two instances using that same socket; it cannot protect against a separate IPMI writer or an instance deliberately using another socket.
 - The service must be running to use `--get-profile` or `--set-profile`. The client neither starts it nor changes fan hardware directly. On timeout or a lost connection, the result may be uncertain: query the running controller before retrying.
+
+For example, with a constant 10% temperature demand, a switch from 45% to `silent` descends through `35 -> 25 -> 15 -> 10`, usually taking about one minute. Warmer components can require a higher target or an immediate increase at any step; `silent` does not mean a fixed 10% command.
 
 The systemd unit creates private runtime and persistent directories. A manually supervised instance creates its own directories if needed and requires them to be private and owned by its effective user. `--socket PATH` selects an alternative endpoint for both controller and CLI; `--state-file PATH` selects the state file for a sampling/control process. Do not expose the endpoint to untrusted users.
 
@@ -95,10 +98,11 @@ The IPMI parser also requires:
 | `CYCLE_SECONDS` | 15 seconds |
 | `DRIVE_SAMPLE_SECONDS` | 60 seconds |
 | `DRIVE_SMART_TIMEOUT` | 5 seconds per disk |
-| `RAMP_DOWN_MAX` | 2 percentage points; decreases at least 15 seconds apart |
+| `RAMP_DOWN_MAX` | 2 percentage points for ordinary temperature-driven decreases; at least 15 seconds apart |
+| `SWITCH_RAMP_DOWN_MAX` | 10 percentage points per normal cycle during a manual profile transition |
 | `HYSTERESIS` | 2 percentage points |
 
-At startup, the first write goes directly to the computed target after a complete valid sample. It is **not** ramped down from the BMC's live duty, including when reloading a saved `silent` profile. Subsequent increases are immediate; decreases are limited to two points with at least one control interval between them. Downward differences smaller than the hysteresis are held, so the commanded duty can remain slightly above the computed target.
+At startup, the first write goes directly to the computed target after a complete valid sample. It is **not** ramped down from the BMC's live duty, including when reloading a saved `silent` profile. Subsequent increases are immediate. Manual profile transitions use the faster rate above; ordinary temperature-driven decreases retain the two-point limit and cooldown. Their actual interval can be longer than 15 seconds because of sampling and cycle alignment. Ordinary downward differences smaller than the hysteresis are held, so the commanded duty can remain slightly above the computed target after a later temperature change.
 
 ### Temperature curves and automatic-control handoff
 
