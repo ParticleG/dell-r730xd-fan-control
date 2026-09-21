@@ -1,6 +1,7 @@
 """Safety regressions; all command execution is replaced by unittest mocks."""
 import contextlib
 import io
+import json
 import signal
 import subprocess
 import sys
@@ -100,7 +101,8 @@ class FanControlTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as directory,
             mock.patch.object(sys, 'argv', ['fan-control', '--control',
                                            '--socket', directory + '/control.sock',
-                                           '--state-file', directory + '/profile']),
+                                           '--state-file', directory + '/profile',
+                                           '--interval-file', directory + '/interval']),
             mock.patch.object(controller.signal, 'signal', side_effect=handlers.__setitem__),
             mock.patch.object(controller, 'sample_drive_temperatures', side_effect=interrupted_sample),
             mock.patch.object(controller, 'fan_restore_auto', side_effect=OSError('BMC unavailable')),
@@ -115,6 +117,7 @@ class ProfileTests(unittest.TestCase):
         self.addCleanup(self.resources.close)
         self.directory = Path(self.resources.enter_context(tempfile.TemporaryDirectory()))
         self.state = self.directory / 'profile'
+        self.interval_state = self.directory / 'interval'
         self.endpoint = str(self.directory / 'control.sock')
         self.automatic = True
         self.pwm_writes = []
@@ -128,7 +131,7 @@ class ProfileTests(unittest.TestCase):
             return_value={'max_by_profile': {'hdd': 30, 'ssd': 35, 'nvme': 36}}))
         self.resources.enter_context(mock.patch.object(sys, 'argv', [
             'fan-control', '--control', '--socket', self.endpoint,
-            '--state-file', str(self.state)]))
+            '--state-file', str(self.state), '--interval-file', str(self.interval_state)]))
         self.resources.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.resources.enter_context(contextlib.redirect_stderr(io.StringIO()))
 
@@ -164,11 +167,11 @@ class ProfileTests(unittest.TestCase):
                     controller.compute_drive_fan_target({'max_by_profile': {'hdd': 45}}, profile)
 
     def test_failed_state_replacement_preserves_previous_selection(self):
-        controller.save_profile(str(self.state), 'balanced')
+        controller.save_setting(str(self.state), 'balanced')
         with mock.patch.object(controller.os, 'replace', side_effect=OSError('disk full')):
             with self.assertRaises(OSError):
-                controller.save_profile(str(self.state), 'silent')
-        self.assertEqual(controller.read_profile(str(self.state)), 'balanced')
+                controller.save_setting(str(self.state), 'silent')
+        self.assertEqual(controller.read_setting(str(self.state), controller.profile_value), 'balanced')
 
     def test_corrupt_saved_profile_prevents_manual_control(self):
         self.state.write_text('unknown\n')
@@ -178,7 +181,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(self.state.read_text(), 'unknown\n')
 
     def test_failed_persistence_restores_automatic_control(self):
-        with mock.patch.object(controller, 'save_profile', side_effect=OSError('disk full')):
+        with mock.patch.object(controller, 'save_setting', side_effect=OSError('disk full')):
             self.assertEqual(controller.main(), 1)
         self.assertTrue(self.automatic)
         self.assertFalse(self.state.exists())
@@ -199,7 +202,7 @@ class ProfileTests(unittest.TestCase):
         with (
             mock.patch.object(controller.signal, 'signal', side_effect=handlers.__setitem__),
             mock.patch.object(controller.subprocess, 'run', side_effect=stopping_ipmi),
-            mock.patch.object(controller, 'wait_for_profile', side_effect=KeyboardInterrupt),
+            mock.patch.object(controller, 'wait_for_control', side_effect=KeyboardInterrupt),
         ):
             self.assertEqual(controller.main(), 0)
         self.assertTrue(self.automatic)
@@ -222,7 +225,7 @@ class ProfileTests(unittest.TestCase):
             samples[0] += 1
             if samples[0] > 2:
                 raise KeyboardInterrupt
-            now[0] += controller.CYCLE_SECONDS + 1
+            now[0] += controller.DEFAULT_INTERVAL + 1
             if samples[0] == 1:
                 peer.connect(self.endpoint)
                 peer.sendall(b'{"command":"set","profile":"performance"}')
@@ -234,12 +237,12 @@ class ProfileTests(unittest.TestCase):
         ):
             self.assertEqual(controller.main(), 0)
         self.assertEqual(self.pwm_writes, [45, 65])
-        self.assertEqual(controller.read_profile(str(self.state)), 'performance')
+        self.assertEqual(controller.read_setting(str(self.state), controller.profile_value), 'performance')
 
     def test_repeated_switches_cannot_accelerate_downward_ramping(self):
         now = [100]
-        actions = iter([(101, 'full-speed'), (102, 'silent'), (103, 'quiet'),
-                        (115, 'balanced'), (116, 'silent')])
+        actions = iter([(100.2, 'full-speed'), (100.4, 'silent'), (100.6, 'quiet'),
+                        (103, 'balanced'), (103.2, 'silent')])
 
         def switch(listener, timeout, status):
             try:
@@ -248,22 +251,22 @@ class ProfileTests(unittest.TestCase):
                 raise KeyboardInterrupt
             connection, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             self.resources.enter_context(peer)
-            return connection, profile
+            return connection, 'profile', profile
 
         with (
             mock.patch.object(controller.time, 'monotonic', side_effect=lambda: now[0]),
-            mock.patch.object(controller, 'wait_for_profile', side_effect=switch),
+            mock.patch.object(controller, 'wait_for_control', side_effect=switch),
         ):
             self.assertEqual(controller.main(), 0)
-        self.assertEqual(self.pwm_writes, [45, 100, 90])
-        self.assertEqual(controller.read_profile(str(self.state)), 'silent')
+        self.assertEqual(self.pwm_writes, [45, 100, 80])
+        self.assertEqual(controller.read_setting(str(self.state), controller.profile_value), 'silent')
         self.assertTrue(self.automatic)
 
     def test_switch_finishes_at_target_then_restores_normal_ramping(self):
         now = [100]
         cpu = [45]
-        actions = iter([(101, 'silent', 60.9), (115, None, 60.9), (130, None, 60.9),
-                        (145, None, 60.9), (160, None, 60.9), (175, None, 60)])
+        actions = iter([(101, 'silent', 63.1), (103, None, 63.1), (106, None, 63.1),
+                        (109, None, 63), (112, None, 60)])
 
         def advance(listener, timeout, status):
             try:
@@ -274,24 +277,24 @@ class ProfileTests(unittest.TestCase):
                 return None
             connection, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             self.resources.enter_context(peer)
-            return connection, profile
+            return connection, 'profile', profile
 
         with (
             mock.patch.object(controller.time, 'monotonic', side_effect=lambda: now[0]),
             mock.patch.object(controller, 'read_all_sensors',
                               side_effect=lambda: (23, 34, 42, cpu[0])),
-            mock.patch.object(controller, 'wait_for_profile', side_effect=advance),
+            mock.patch.object(controller, 'wait_for_control', side_effect=advance),
         ):
             self.assertEqual(controller.main(), 0)
         # The final one-point switch step must not stick in normal hysteresis.
-        # A later temperature-driven target of 10 resumes two-point reductions.
-        self.assertEqual(self.pwm_writes, [45, 35, 25, 15, 14, 12])
-        self.assertEqual(controller.read_profile(str(self.state)), 'silent')
+        # Normal hysteresis then holds 24 above a target of 23; a larger drop reaches 10.
+        self.assertEqual(self.pwm_writes, [45, 25, 24, 10])
+        self.assertEqual(controller.read_setting(str(self.state), controller.profile_value), 'silent')
         self.assertTrue(self.automatic)
 
-    def test_sensor_failure_during_fast_transition_restores_automatic_control(self):
+    def test_sensor_failure_during_transition_restores_automatic_control(self):
         now = [100]
-        actions = iter([(101, 'silent'), (115, None), (130, None)])
+        actions = iter([(101, 'silent'), (103, None), (106, None)])
 
         def advance(listener, timeout, status):
             now[0], profile = next(actions)
@@ -299,40 +302,153 @@ class ProfileTests(unittest.TestCase):
                 return None
             connection, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             self.resources.enter_context(peer)
-            return connection, profile
+            return connection, 'profile', profile
 
         def sensors():
-            if now[0] >= 130:
+            if now[0] >= 106:
                 raise controller.SensorError('Required fan became unhealthy')
             return 23, 34, 42, 45
 
         with (
             mock.patch.object(controller.time, 'monotonic', side_effect=lambda: now[0]),
             mock.patch.object(controller, 'read_all_sensors', side_effect=sensors),
-            mock.patch.object(controller, 'wait_for_profile', side_effect=advance),
+            mock.patch.object(controller, 'wait_for_control', side_effect=advance),
         ):
             self.assertEqual(controller.main(), 1)
-        self.assertEqual(self.pwm_writes, [45, 35])
+        self.assertEqual(self.pwm_writes, [45, 25])
         self.assertTrue(self.automatic)
 
     def test_restart_loads_saved_profile_and_explicit_override_replaces_it(self):
-        controller.save_profile(str(self.state), 'performance')
-        with mock.patch.object(controller, 'wait_for_profile', side_effect=KeyboardInterrupt):
+        controller.save_setting(str(self.state), 'performance')
+        with mock.patch.object(controller, 'wait_for_control', side_effect=KeyboardInterrupt):
             self.assertEqual(controller.main(), 0)
             with mock.patch.object(sys, 'argv', sys.argv + ['--profile', 'balanced']):
                 self.assertEqual(controller.main(), 0)
         self.assertEqual(self.pwm_writes, [65, 45])
-        self.assertEqual(controller.read_profile(str(self.state)), 'balanced')
+        self.assertEqual(controller.read_setting(str(self.state), controller.profile_value), 'balanced')
         self.assertTrue(self.automatic)
 
     def test_read_only_profile_override_does_not_change_saved_selection(self):
-        controller.save_profile(str(self.state), 'performance')
+        controller.save_setting(str(self.state), 'performance')
+        controller.save_setting(str(self.interval_state), 10)
         with mock.patch.object(sys, 'argv', ['fan-control', '--check', '--profile', 'silent',
-                                           '--state-file', str(self.state)]):
+                                           '--state-file', str(self.state), '--interval', '0.5',
+                                           '--interval-file', str(self.interval_state)]):
             self.assertEqual(controller.main(), 0)
-        self.assertEqual(controller.read_profile(str(self.state)), 'performance')
+        self.assertEqual(controller.read_setting(str(self.state), controller.profile_value), 'performance')
+        self.assertEqual(controller.read_setting(str(self.interval_state), controller.interval_value), 10)
         self.assertTrue(self.automatic)
         self.assertEqual(self.pwm_writes, [])
+
+    def test_normal_cooling_uses_every_cycle_despite_sensor_latency(self):
+        now = [100]
+        temperatures = iter([69, 45, 45])
+        sample_starts = []
+
+        def sensors():
+            sample_starts.append(now[0])
+            now[0] += 1
+            return 23, 34, 42, next(temperatures)
+
+        def advance(listener, timeout, status):
+            if len(sample_starts) == 3:
+                raise KeyboardInterrupt
+            now[0] += timeout
+
+        with (
+            mock.patch.object(controller.time, 'monotonic', side_effect=lambda: now[0]),
+            mock.patch.object(controller, 'read_all_sensors', side_effect=sensors),
+            mock.patch.object(controller, 'wait_for_control', side_effect=advance),
+        ):
+            self.assertEqual(controller.main(), 0)
+        self.assertEqual(sample_starts, [100, 103, 106])
+        self.assertEqual(self.pwm_writes, [74, 54, 45])
+        self.assertTrue(self.automatic)
+
+    def test_interval_changes_reschedule_without_extra_downward_steps(self):
+        now = [100]
+        actions = iter([
+            (100.1, 'profile', 'full-speed'), (100.2, 'profile', 'silent'),
+            (100.25, 'interval', 0.5), (100.5, None, None),
+            (100.6, 'interval', 10), (100.7, 'interval', 0.5), (101, None, None),
+        ])
+
+        def advance(listener, timeout, status):
+            try:
+                now[0], key, value = next(actions)
+            except StopIteration:
+                raise KeyboardInterrupt
+            if key is None:
+                return None
+            connection, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            self.resources.enter_context(peer)
+            return connection, key, value
+
+        with (
+            mock.patch.object(controller.time, 'monotonic', side_effect=lambda: now[0]),
+            mock.patch.object(controller, 'wait_for_control', side_effect=advance),
+        ):
+            self.assertEqual(controller.main(), 0)
+        self.assertEqual(self.pwm_writes, [45, 100, 80, 60])
+        self.assertEqual(controller.read_setting(str(self.interval_state), controller.interval_value), 0.5)
+        self.assertEqual(controller.read_setting(str(self.state), controller.profile_value), 'silent')
+
+    def test_saved_interval_and_override_survive_restarts(self):
+        controller.save_setting(str(self.interval_state), 10)
+        waits = []
+
+        def stop_after_cycle(listener, timeout, status):
+            waits.append(timeout)
+            raise KeyboardInterrupt
+
+        with (
+            mock.patch.object(controller.time, 'monotonic', return_value=100),
+            mock.patch.object(controller, 'wait_for_control', side_effect=stop_after_cycle),
+        ):
+            self.assertEqual(controller.main(), 0)
+            with mock.patch.object(sys, 'argv', sys.argv + ['--interval', '0.5']):
+                self.assertEqual(controller.main(), 0)
+            self.assertEqual(controller.main(), 0)
+        self.assertEqual(waits, [10, 0.5, 0.5])
+        self.assertEqual(controller.read_setting(str(self.interval_state), controller.interval_value), 0.5)
+
+    def test_invalid_interval_commands_leave_the_controller_available(self):
+        status = {'profile': 'balanced', 'interval': 3}
+        with controller.control_socket(self.endpoint) as listener:
+            for value in (0.49, 10.01, float('nan'), 10 ** 400, True, None):
+                with self.subTest(value=value), socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as peer:
+                    peer.settimeout(1)
+                    peer.connect(self.endpoint)
+                    peer.sendall(json.dumps({'command': 'set-interval', 'interval': value}).encode())
+                    request = controller.wait_for_control(listener, 0, status)
+                    if request is not None:
+                        request[0].close()
+                    self.assertIsNone(request)
+                    self.assertIn('error', json.loads(peer.recv(4096)))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as peer:
+                peer.settimeout(1)
+                peer.connect(self.endpoint)
+                peer.sendall(b'{"command":"get"}')
+                self.assertIsNone(controller.wait_for_control(listener, 0, status))
+                self.assertEqual(json.loads(peer.recv(4096))['interval'], 3)
+
+    def test_corrupt_saved_interval_prevents_manual_control(self):
+        self.interval_state.write_text('NaN\n')
+        self.assertEqual(controller.main(), 1)
+        self.assertEqual(self.pwm_writes, [])
+        self.assertTrue(self.automatic)
+
+    def test_interval_save_failure_restores_auto_and_preserves_previous_value(self):
+        controller.save_setting(str(self.state), 'balanced')
+        controller.save_setting(str(self.interval_state), 10)
+        with (
+            mock.patch.object(sys, 'argv', sys.argv + ['--interval', '3']),
+            mock.patch.object(controller.os, 'replace', side_effect=OSError('disk full')),
+            mock.patch.object(controller, 'wait_for_control', side_effect=KeyboardInterrupt),
+        ):
+            self.assertEqual(controller.main(), 1)
+        self.assertEqual(controller.read_setting(str(self.interval_state), controller.interval_value), 10)
+        self.assertTrue(self.automatic)
 
 
 if __name__ == '__main__':

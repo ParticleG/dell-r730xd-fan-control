@@ -53,26 +53,28 @@ python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --get-profile
 python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --set-profile performance
 # Return to the original policy:
 python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --set-profile balanced
+# Set and persist the detection interval in seconds (0.5-10):
+python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --set-interval 3
 ```
 
 `--set-profile silent` and `--set-profile quiet` use the same interface, but require assessment of the low-airflow risks above before any hardware trial.
 
-- A changed selection wakes the control loop without restarting the process. The loop completes any in-progress SMART/IPMI operation and performs a control cycle before acknowledging the change. Existing SMART sampling/cache rules are retained. Switching is not a hard-real-time operation; the CLI waits up to 120 seconds.
-- A successful response includes `profile`, `pwm` (last commanded duty) and `profile_target_pwm` (the temperature curve's demand before downward ramping). `--get-profile` returns the last completed cycle, not a new hardware measurement. Selecting the already active profile returns that status without another sample or state write.
-- Increases are immediate once the control cycle succeeds. A changed profile starts a temporary fast downward transition: at most **10 percentage points per normal control cycle** (nominally 15 seconds). Extra command-triggered cycles cannot take downward steps or reset that schedule. Switching to a lower ceiling does **not** abruptly clamp the current duty to it.
-- Every transition step uses the current temperature-derived demand, not simply the preset floor. Once the rounded-up target is reached, ordinary temperature-driven decreases resume their two-point limit, existing cooldown and hysteresis. The last transition step may be smaller than two points so it can finish at the target instead of getting stuck just above it. Reselecting the active profile does not restart a transition.
-- The controller atomically saves the selected name in `/var/lib/ipmi-fan-control/profile` after the successful cycle. It is reused after service or machine restarts. A save failure is an error and triggers automatic-control recovery rather than reporting a successful switch.
-- Startup selection order is explicit `--profile NAME`, then the saved name, then `balanced`. In control mode an explicit startup override is saved after its first successful cycle. A corrupt saved name prevents manual control; a deliberate `--profile balanced` override can replace it. Read-only `--check`/`--monitor` never save their selections.
+- A changed profile or interval wakes the control loop without restarting the process. The loop completes any in-progress SMART/IPMI operation and performs a control cycle before acknowledging the change. Existing SMART sampling/cache rules are retained. Changes are not hard-real-time operations; the CLI waits up to 120 seconds.
+- A successful response includes `profile`, `interval` (configured seconds), `pwm` (last commanded duty) and `profile_target_pwm` (the temperature curve's demand before downward ramping). `--get-profile` returns this last completed status, not a new hardware measurement. Selecting an already active value returns that status without another sample or state write.
+- Increases are immediate once the control cycle succeeds. All decreases are limited to **20 percentage points per normal detection cycle**, for both temperature changes and manual profile transitions. Extra command-triggered cycles cannot bypass the current interval or take extra downward steps. Switching to a lower ceiling does **not** abruptly clamp the current duty to it.
+- Every downward step uses the current temperature-derived demand, not simply the preset floor. Ordinary decreases retain the two-point hysteresis; a manual profile transition may take a final one-point step to finish at the rounded-up target. Reselecting the active profile does not restart a transition.
+- The controller atomically saves the profile name in `/var/lib/ipmi-fan-control/profile` and the interval in `/var/lib/ipmi-fan-control/interval` after successful cycles. Both survive service and machine restarts. These are separate settings, not an atomic multi-setting transaction. A save failure triggers automatic-control recovery rather than acknowledging success. Existing profile files need no migration.
+- Startup precedence is explicit `--profile NAME` / `--interval SECONDS`, then each saved value, then `balanced` / **3 seconds**. In control mode startup overrides are saved after the first successful cycle. Invalid saved settings prevent manual control; an explicit valid override can replace the corresponding bad value. Read-only `--check`/`--monitor` never save either setting.
 - The default endpoint is `/run/ipmi-fan-control/control.sock`, accessible only to root under the supplied service. The endpoint lock prevents two instances using that same socket; it cannot protect against a separate IPMI writer or an instance deliberately using another socket.
-- The service must be running to use `--get-profile` or `--set-profile`. The client neither starts it nor changes fan hardware directly. On timeout or a lost connection, the result may be uncertain: query the running controller before retrying.
+- The service must be running to use `--get-profile`, `--set-profile` or `--set-interval`. The client neither starts it nor changes fan hardware directly. On timeout or a lost connection, the result may be uncertain: query the running controller before retrying.
 
-For example, with a constant 10% temperature demand, a switch from 45% to `silent` descends through `35 -> 25 -> 15 -> 10`, usually taking about one minute. Warmer components can require a higher target or an immediate increase at any step; `silent` does not mean a fixed 10% command.
+For example, with a constant 10% temperature demand, a switch from 45% to `silent` descends through `25 -> 10` over two normal detection cycles. With the default 3-second interval, budget roughly 6 seconds plus command and sampling latency; overruns can take longer. Warmer components can require a higher target or an immediate increase at any step; `silent` does not mean a fixed 10% command.
 
-The systemd unit creates private runtime and persistent directories. A manually supervised instance creates its own directories if needed and requires them to be private and owned by its effective user. `--socket PATH` selects an alternative endpoint for both controller and CLI; `--state-file PATH` selects the state file for a sampling/control process. Do not expose the endpoint to untrusted users.
+The systemd unit creates private runtime and persistent directories. A manually supervised instance creates its own directories if needed and requires them to be private and owned by its effective user. `--socket PATH` selects an alternative endpoint for both controller and CLI; `--state-file PATH` and `--interval-file PATH` select the independent profile and interval state files for a sampling/control process. Use separate files and override both paths for an isolated instance. Do not expose the endpoint to untrusted users.
 
 ## Current host-specific policy
 
-The authoritative preset endpoints, sensor limits and sampling settings are in [ipmi_fan_control.py](ipmi_fan_control.py). The state file stores only a selected name, not arbitrary editable curves; editing source still requires deployment and a service restart.
+The authoritative preset endpoints, sensor limits and interval bounds are in [ipmi_fan_control.py](ipmi_fan_control.py). The state files store only the selected profile name and detection interval, not arbitrary editable curves; editing source still requires deployment and a service restart.
 
 `EXPECTED_DRIVE_COUNTS` requires at least:
 
@@ -95,14 +97,15 @@ The IPMI parser also requires:
 | Setting | Current value |
 | --- | ---: |
 | PWM endpoints | Selected from `FAN_PROFILES`; see the preset table |
-| `CYCLE_SECONDS` | 15 seconds |
+| Detection interval | Default 3 seconds; configurable and persistent from 0.5 to 10 seconds |
 | `DRIVE_SAMPLE_SECONDS` | 60 seconds |
 | `DRIVE_SMART_TIMEOUT` | 5 seconds per disk |
-| `RAMP_DOWN_MAX` | 2 percentage points for ordinary temperature-driven decreases; at least 15 seconds apart |
-| `SWITCH_RAMP_DOWN_MAX` | 10 percentage points per normal cycle during a manual profile transition |
+| `RAMP_DOWN_MAX` | 20 percentage points per normal detection cycle |
 | `HYSTERESIS` | 2 percentage points |
 
-At startup, the first write goes directly to the computed target after a complete valid sample. It is **not** ramped down from the BMC's live duty, including when reloading a saved `silent` profile. Subsequent increases are immediate. Manual profile transitions use the faster rate above; ordinary temperature-driven decreases retain the two-point limit and cooldown. Their actual interval can be longer than 15 seconds because of sampling and cycle alignment. Ordinary downward differences smaller than the hysteresis are held, so the commanded duty can remain slightly above the computed target after a later temperature change.
+At startup, the first write goes directly to the computed target after a complete valid sample. It is **not** ramped down from the BMC's live duty, including when reloading a saved `silent` profile. Subsequent increases are immediate. Downward steps follow the configured detection cycle without an additional post-write cooldown. Ordinary downward differences smaller than the hysteresis are held, so the commanded duty can remain slightly above the computed target after a later temperature change.
+
+The interval schedules CPU, inlet/exhaust and fan-health sampling; it does not change the independent 60-second SMART sweep. Sampling and fan writes remain serial: the configured 0.5-second minimum is a scheduling request, not a guarantee of fresh BMC data every 500 ms. IPMI reads, SMART sweeps and BMC sensor refresh can limit the effective rate. When a cycle overruns, the controller polls queued commands and starts the next cycle without an extra sleep; it does not queue overlapping hardware scans. Changing the interval reschedules from the last normal cycle's start, without granting extra downward steps inside the newly selected interval.
 
 ### Temperature curves and automatic-control handoff
 
@@ -141,7 +144,7 @@ Normal control-mode exit, `SIGINT` and `SIGTERM` run the program's restore path.
 
 Once exit cleanup begins, further `SIGINT` and `SIGTERM` requests are ignored so they cannot interrupt the bounded automatic-control restore attempt. Forced termination and the systemd fallback retain their existing behavior.
 
-Each cycle emits JSON, including the selected `profile`. `pwm` is the last successfully commanded percentage, **not a BMC mode/duty readback**. `profile_target_pwm` is the curve's demand; `target_pwm` includes ramping and hysteresis. `fan_rpm` contains measured values sampled before that cycle's write; a speed change can appear in the following sample. Read-only mode reports `pwm: null`. Always consider measured RPM alongside the requested duty, and never overlap controllers or fault-injection runs.
+Each cycle emits JSON, including the selected `profile`, configured `interval` in seconds, and a millisecond-resolution timestamp. `pwm` is the last successfully commanded percentage, **not a BMC mode/duty readback**. `profile_target_pwm` is the curve's demand; `target_pwm` includes ramping and hysteresis. `fan_rpm` contains measured values sampled before that cycle's write; a speed change can appear in the following sample. Read-only mode reports `pwm: null`. Always consider measured RPM alongside the requested duty, and never overlap controllers or fault-injection runs.
 
 ## Install or update on PVE
 
@@ -242,7 +245,7 @@ Do not resume manual control if restoration fails. Investigate local IPMI access
 
 ## Tuning and validation limits
 
-Edit `FAN_PROFILES`, `EXPECTED_DRIVE_COUNTS`, `AIR_PROFILES`, `CPU_PROFILE_OVERRIDES`, `DRIVE_PROFILES` and timing constants only after assessing the actual host. `CPU_PROFILE_OVERRIDES` changes only the named presets' CPU curves; the inlet, exhaust and disk limits and all sensor validity checks remain shared. Commit and test local changes, stop the installed service, deploy the reviewed files, validate inputs, and run another supervised trial before enabling the service again. Keep this policy documentation in sync with changed constants. Selecting an existing profile is the only operation that takes effect without a restart.
+Edit `FAN_PROFILES`, `EXPECTED_DRIVE_COUNTS`, `AIR_PROFILES`, `CPU_PROFILE_OVERRIDES`, `DRIVE_PROFILES` and interval bounds only after assessing the actual host. `CPU_PROFILE_OVERRIDES` changes only the named presets' CPU curves; the inlet, exhaust and disk limits and all sensor validity checks remain shared. Commit and test local changes, stop the installed service, deploy the reviewed files, validate inputs, and run another supervised trial before enabling the service again. Keep this policy documentation in sync with changed constants. Selecting an existing profile or setting an interval within the supported range takes effect without a restart.
 
 The original deployment was checked at 23°C inlet with a bounded five-minute workload using 12 CPU workers and 18.75 GiB of read-only disk I/O across 14 drives. The controller raised PWM under load and reduced it afterward. Normal stop, missing CPU temperature, a successful SMART response without temperature, rejected PWM writes and a `SIGSTOP` watchdog recovery were exercised. These hardware fault-injection helpers are intentionally not shipped as ordinary developer tests.
 

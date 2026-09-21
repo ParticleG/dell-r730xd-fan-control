@@ -13,7 +13,8 @@ Neither mechanism can protect against a frozen kernel or an unreachable BMC.
 
 The balanced profile preserves the original 45% floor. Silent and quiet are
 unvalidated low-airflow presets: H330 and X540 temperatures are not exposed.
-Profile selection persists locally; runtime switching needs no service restart.
+Profile and detection-interval selections persist locally; runtime changes
+need no service restart.
 """
 
 import argparse
@@ -80,10 +81,12 @@ MIN_FAN_PERCENT = min(bounds[0] for bounds in FAN_PROFILES.values())
 MAX_FAN_PERCENT = max(bounds[1] for bounds in FAN_PROFILES.values())
 CONTROL_SOCKET = "/run/ipmi-fan-control/control.sock"
 PROFILE_STATE_FILE = "/var/lib/ipmi-fan-control/profile"
+INTERVAL_STATE_FILE = "/var/lib/ipmi-fan-control/interval"
 HYSTERESIS = 2
-RAMP_DOWN_MAX = 2
-SWITCH_RAMP_DOWN_MAX = 10
-CYCLE_SECONDS = 15
+RAMP_DOWN_MAX = 20
+DEFAULT_INTERVAL = 3.0
+MIN_INTERVAL = 0.5
+MAX_INTERVAL = 10.0
 DRIVE_SAMPLE_SECONDS = 60
 DRIVE_SMART_TIMEOUT = 5
 EXPECTED_DRIVE_COUNTS = {"hdd": 10, "ssd": 2, "nvme": 2}
@@ -136,9 +139,7 @@ def apply_ramping(current, target, allow_decrease=True, switching=False):
         return target
     if not allow_decrease:
         return current
-    if switching:
-        return max(target, current - SWITCH_RAMP_DOWN_MAX)
-    if current - target < HYSTERESIS:
+    if not switching and current - target < HYSTERESIS:
         return current
     return max(target, current - RAMP_DOWN_MAX)
 
@@ -334,24 +335,43 @@ def private_directory(path, create=False):
     return directory
 
 
-def read_profile(path):
+def profile_value(value):
+    if not isinstance(value, str) or value not in FAN_PROFILES:
+        raise ValueError(f"Unknown profile: {value!r}")
+    return value
+
+
+def interval_value(value):
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError("Interval must be a number of seconds")
+    try:
+        interval = float(value)
+    except OverflowError as error:
+        raise ValueError("Interval is outside the supported range") from error
+    if not math.isfinite(interval) or not MIN_INTERVAL <= interval <= MAX_INTERVAL:
+        raise ValueError(f"Interval must be between {MIN_INTERVAL} and {MAX_INTERVAL} seconds")
+    return interval
+
+
+def read_setting(path, parse):
     try:
         private_directory(path)
         with open(path) as state:
-            profile = state.read(64).strip()
+            value = state.read(64).strip()
     except FileNotFoundError:
         return None
-    if profile not in FAN_PROFILES:
-        raise ValueError(f"Invalid saved profile in {path}: {profile!r}")
-    return profile
+    try:
+        return parse(value)
+    except ValueError as error:
+        raise ValueError(f"Invalid saved setting in {path}: {value!r}") from error
 
 
-def save_profile(path, profile):
+def save_setting(path, value):
     directory = private_directory(path, create=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=".profile-", dir=directory)
+    descriptor, temporary = tempfile.mkstemp(prefix=".setting-", dir=directory)
     try:
         with os.fdopen(descriptor, "w") as state:
-            state.write(profile + "\n")
+            state.write(str(value) + "\n")
             state.flush()
             os.fsync(state.fileno())
         os.replace(temporary, path)
@@ -384,7 +404,7 @@ def control_socket(path):
                 os.unlink(path)
 
 
-def reply_profile(connection, response):
+def reply_control(connection, response):
     with connection:
         try:
             connection.sendall(json.dumps(response).encode())
@@ -393,7 +413,7 @@ def reply_profile(connection, response):
             pass
 
 
-def wait_for_profile(listener, timeout, status):
+def wait_for_control(listener, timeout, status):
     until = time.monotonic() + timeout
     # An overrun leaves no idle time, but queued commands still need one poll.
     first_poll = True
@@ -407,25 +427,27 @@ def wait_for_profile(listener, timeout, status):
         try:
             request = json.loads(connection.recv(1024))
             if not isinstance(request, dict):
-                raise ValueError("Expected a profile command object")
+                raise ValueError("Expected a control command object")
             command = request.get("command")
             if command == "get":
-                reply_profile(connection, status)
+                reply_control(connection, status)
                 continue
-            profile = request.get("profile")
-            if command != "set" or not isinstance(profile, str) or profile not in FAN_PROFILES:
-                raise ValueError("Unknown profile command or profile name")
-            if profile == status["profile"]:
-                reply_profile(connection, status)
+            if command == "set":
+                key, value = "profile", profile_value(request.get("profile"))
+            elif command == "set-interval":
+                key, value = "interval", interval_value(request.get("interval"))
+            else:
+                raise ValueError("Unknown control command")
+            if value == status[key]:
+                reply_control(connection, status)
                 continue
-            return connection, profile
+            return connection, key, value
         except (OSError, ValueError) as error:
-            reply_profile(connection, {"error": str(error)})
+            reply_control(connection, {"error": str(error)})
     return None
 
 
-def request_profile(path, profile):
-    request = {"command": "get"} if profile is None else {"command": "set", "profile": profile}
+def request_control(path, request):
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
         # The main loop may be finishing a SMART sweep; never interrupt its checks.
         connection.settimeout(120)
@@ -446,29 +468,42 @@ def main():
     mode.add_argument("--list-profiles", action="store_true", help="list presets without hardware access")
     mode.add_argument("--get-profile", action="store_true", help="query the running controller")
     mode.add_argument("--set-profile", choices=FAN_PROFILES, help="switch and persist the running profile")
+    mode.add_argument("--set-interval", type=interval_value,
+                      help="change and persist the running interval in seconds (0.5-10)")
     parser.add_argument("--profile", choices=FAN_PROFILES,
                         help="startup override; otherwise saved profile, then balanced")
+    parser.add_argument("--interval", type=interval_value,
+                        help="startup interval in seconds (0.5-10); otherwise saved value, then 3")
     parser.add_argument("--socket", default=CONTROL_SOCKET, help="local control socket path")
     parser.add_argument("--state-file", default=PROFILE_STATE_FILE, help="controller profile state path")
+    parser.add_argument("--interval-file", default=INTERVAL_STATE_FILE,
+                        help="controller sampling interval state path")
     parser.add_argument("--duration", type=float, help="stop after this many seconds")
     args = parser.parse_args()
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
         parser.error("--duration must be finite and positive")
-    client_mode = args.list_profiles or args.get_profile or args.set_profile is not None
-    if client_mode and (args.profile is not None or args.duration is not None):
-        parser.error("--profile and --duration apply only to sampling/control modes")
+    client_mode = (args.list_profiles or args.get_profile or args.set_profile is not None
+                   or args.set_interval is not None)
+    if client_mode and (args.profile is not None or args.interval is not None
+                        or args.duration is not None):
+        parser.error("--profile, --interval and --duration apply only to sampling/control modes")
     if args.list_profiles:
         print(json.dumps({"default": DEFAULT_PROFILE, "profiles": {
             name: {"floor": low, "ceiling": high}
             for name, (low, high) in FAN_PROFILES.items()
         }}))
         return 0
-    if args.get_profile or args.set_profile is not None:
+    if args.get_profile or args.set_profile is not None or args.set_interval is not None:
+        request = {"command": "get"}
+        if args.set_profile is not None:
+            request = {"command": "set", "profile": args.set_profile}
+        elif args.set_interval is not None:
+            request = {"command": "set-interval", "interval": args.set_interval}
         try:
-            print(json.dumps(request_profile(args.socket, args.set_profile)))
+            print(json.dumps(request_control(args.socket, request)))
             return 0
         except (OSError, ValueError, RuntimeError) as error:
-            print(f"[ERROR] Profile request failed: {error}", file=sys.stderr, flush=True)
+            print(f"[ERROR] Control request failed: {error}", file=sys.stderr, flush=True)
             return 1
 
     def stop(signum, frame):
@@ -489,22 +524,24 @@ def main():
 
     deadline = time.monotonic() + args.duration if args.duration is not None else None
     current_fan = None
-    next_cycle = 0
-    next_decrease = 0
+    last_cycle_start = None
     last_sample = None
     drive_summary = None
     pending = None
     switching = False
-    failure = "Controller stopped before the profile switch completed"
+    failure = "Controller stopped before the configuration change completed"
     exit_code = 0
     try:
-        saved_profile = read_profile(args.state_file) if args.profile is None else None
+        saved_profile = read_setting(args.state_file, profile_value) if args.profile is None else None
         profile = args.profile or saved_profile or DEFAULT_PROFILE
+        saved_interval = (read_setting(args.interval_file, interval_value)
+                          if args.interval is None else None)
+        interval = args.interval or saved_interval or DEFAULT_INTERVAL
         while deadline is None or time.monotonic() < deadline:
             cycle_start = time.monotonic()
-            normal_cycle = cycle_start >= next_cycle
+            normal_cycle = last_cycle_start is None or cycle_start >= last_cycle_start + interval
             if normal_cycle:
-                next_cycle = cycle_start + CYCLE_SECONDS
+                last_cycle_start = cycle_start
             # Never enter manual mode before the first complete valid sample.
             if last_sample is None or cycle_start - last_sample >= DRIVE_SAMPLE_SECONDS:
                 drive_summary = sample_drive_temperatures()
@@ -512,25 +549,24 @@ def main():
             inlet, exhaust, temp1, temp2 = read_all_sensors()
             target = max(compute_fan_target(inlet, max(temp1, temp2), exhaust, profile),
                          compute_drive_fan_target(drive_summary, profile))
-            allow_decrease = normal_cycle if switching else cycle_start >= next_decrease
-            requested_fan = apply_ramping(current_fan, target, allow_decrease, switching)
+            requested_fan = apply_ramping(current_fan, target, normal_cycle, switching)
             if args.control and requested_fan != current_fan:
                 if current_fan is None:
                     fan_enable_manual()
                 fan_set_percent(requested_fan)
-                if current_fan is None or requested_fan < current_fan:
-                    # Ordinary temperature-driven reductions retain their cooldown.
-                    next_decrease = time.monotonic() + CYCLE_SECONDS
                 current_fan = requested_fan
             if switching and current_fan == math.ceil(target):
                 switching = False
             if args.control and profile != saved_profile:
-                save_profile(args.state_file, profile)
+                save_setting(args.state_file, profile)
                 saved_profile = profile
-            status = {"profile": profile, "pwm": current_fan,
+            if args.control and interval != saved_interval:
+                save_setting(args.interval_file, interval)
+                saved_interval = interval
+            status = {"profile": profile, "interval": interval, "pwm": current_fan,
                       "profile_target_pwm": math.ceil(target)}
             print(json.dumps({
-                "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
                 "mode": "manual" if args.control else "monitor",
                 **status, "target_pwm": requested_fan,
                 "inlet": inlet, "exhaust": exhaust, "cpu": [temp1, temp2],
@@ -540,20 +576,24 @@ def main():
             }), flush=True)
             notify_watchdog()
             if pending is not None:
-                reply_profile(pending, status)
+                reply_control(pending, status)
                 pending = None
             if not args.control and not args.monitor:
                 break
-            wait = max(0, next_cycle - time.monotonic())
+            wait = max(0, last_cycle_start + interval - time.monotonic())
             if deadline is not None:
                 wait = min(wait, max(0, deadline - time.monotonic()))
             if listener is None:
                 time.sleep(wait)
             else:
-                request = wait_for_profile(listener, wait, status)
+                request = wait_for_control(listener, wait, status)
                 if request is not None:
-                    pending, profile = request
-                    switching = True
+                    pending, key, value = request
+                    if key == "profile":
+                        profile = value
+                        switching = True
+                    else:
+                        interval = value
     except KeyboardInterrupt:
         pass
     except Exception as error:
@@ -573,7 +613,7 @@ def main():
                       file=sys.stderr, flush=True)
                 exit_code = 1
         if pending is not None:
-            reply_profile(pending, {"error": failure})
+            reply_control(pending, {"error": failure})
         resources.close()
     return exit_code
 
