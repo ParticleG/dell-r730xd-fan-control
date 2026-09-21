@@ -145,16 +145,21 @@ class ProfileTests(unittest.TestCase):
         return subprocess.CompletedProcess(command, 0, '', '')
 
     def test_profiles_request_distinct_duties_for_the_same_cpu_load(self):
-        for profile, expected in {'silent': 42.5, 'quiet': 50, 'balanced': 60,
+        for profile, expected in {'silent': 10, 'quiet': 50, 'balanced': 60,
                                   'performance': 82.5, 'full-speed': 100}.items():
             with self.subTest(profile=profile):
                 self.assertEqual(controller.compute_fan_target(23, 60, 34, profile), expected)
 
+    def test_silent_cpu_ramp_crosses_the_legacy_handoff(self):
+        self.assertAlmostEqual(controller.compute_fan_target(23, 70, 34, 'silent'), 160 / 3)
+
     def test_extreme_profiles_do_not_bypass_air_or_disk_handoff(self):
-        for profile in ('silent', 'full-speed'):
+        for profile, cpu_limit in (('silent', 75), ('full-speed', 70)):
             with self.subTest(profile=profile):
-                with self.assertRaises(controller.SensorError):
-                    controller.compute_fan_target(23, 70, 34, profile)
+                for inlet, cpu, exhaust in ((32, 45, 34), (23, 45, 50), (23, cpu_limit, 34)):
+                    with self.subTest(inlet=inlet, cpu=cpu, exhaust=exhaust):
+                        with self.assertRaises(controller.SensorError):
+                            controller.compute_fan_target(inlet, cpu, exhaust, profile)
                 with self.assertRaises(controller.SensorError):
                     controller.compute_drive_fan_target({'max_by_profile': {'hdd': 45}}, profile)
 
@@ -257,8 +262,8 @@ class ProfileTests(unittest.TestCase):
     def test_switch_finishes_at_target_then_restores_normal_ramping(self):
         now = [100]
         cpu = [45]
-        actions = iter([(101, 'silent', 51), (115, None, 51), (130, None, 51),
-                        (145, None, 51), (160, None, 51), (175, None, 50)])
+        actions = iter([(101, 'silent', 60.9), (115, None, 60.9), (130, None, 60.9),
+                        (145, None, 60.9), (160, None, 60.9), (175, None, 60)])
 
         def advance(listener, timeout, status):
             try:

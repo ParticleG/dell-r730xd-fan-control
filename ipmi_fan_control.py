@@ -90,6 +90,7 @@ EXPECTED_DRIVE_COUNTS = {"hdd": 10, "ssd": 2, "nvme": 2}
 
 # (start increasing PWM, return to the iDRAC automatic policy), in Celsius.
 AIR_PROFILES = {"inlet": (26, 32), "exhaust": (38, 50), "cpu": (50, 70)}
+CPU_PROFILE_OVERRIDES = {"silent": (60, 75)}
 DRIVE_PROFILES = {"hdd": (35, 45), "ssd": (45, 60), "nvme": (50, 65)}
 
 
@@ -114,7 +115,9 @@ def lerp(value, in_low, in_high, out_low, out_high):
 
 
 def compute_fan_target(inlet, cpu_max, exhaust, profile):
-    return max(component_target(value, AIR_PROFILES[name], name, profile)
+    cpu_limits = CPU_PROFILE_OVERRIDES.get(profile, AIR_PROFILES["cpu"])
+    return max(component_target(value, cpu_limits if name == "cpu" else AIR_PROFILES[name],
+                                name, profile)
                for name, value in (("inlet", inlet), ("cpu", cpu_max),
                                    ("exhaust", exhaust)))
 

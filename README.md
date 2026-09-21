@@ -34,7 +34,7 @@ The tests replace command execution with mocks; they do not access IPMI or disks
 
 ## Profiles and runtime commands
 
-Each preset uses the same component temperature curves, disk requirements and automatic-control handoff thresholds. Only the PWM endpoints differ:
+Presets share the inlet, exhaust and disk temperature limits, disk requirements and sensor validity checks. `silent` alone uses a later CPU ramp and handoff (60°C / 75°C); all other presets keep 50°C / 70°C. PWM endpoints are:
 
 | Profile | PWM floor | PWM ceiling | Purpose |
 | --- | ---: | ---: | --- |
@@ -108,16 +108,19 @@ At startup, the first write goes directly to the computed target after a complet
 
 Each component independently requests a linear increase between the selected profile's PWM endpoints over the two temperatures below. The highest request wins. At or above the handoff threshold, every profile exits manual control and attempts to restore the iDRAC automatic policy instead of keeping a fixed emergency PWM. This includes `full-speed`: its 100% command is not an exception to the handoff checks.
 
-**These are conservative policy thresholds, not manufacturer temperature limits.**
+**These are software policy thresholds, not manufacturer temperature limits or target temperatures.**
 
 | Component | Start increasing PWM | Handoff to iDRAC at or above |
 | --- | ---: | ---: |
 | Inlet | 26°C | 32°C |
 | Exhaust | 38°C | 50°C |
-| Hottest CPU | 50°C | 70°C |
+| Hottest CPU (`silent`) | 60°C | 75°C |
+| Hottest CPU (all other profiles) | 50°C | 70°C |
 | Hottest HDD | 35°C | 45°C |
 | Hottest non-NVMe SSD | 45°C | 60°C |
 | Hottest NVMe | 50°C | 65°C |
+
+The `silent` CPU curve requests its 10% floor through 60°C, then rises linearly toward 75% just below 75°C. At 75°C it hands back to iDRAC instead of holding that temperature. This higher handoff threshold is experimental and has not been thermally validated under high load; it does not modify iDRAC warning or critical thresholds. Other components can demand more airflow even with the CPUs below 60°C.
 
 SMART uses automatic device detection. Do not reintroduce a forced `-d scsi` for all SATA disks: that returned success without temperature on the validated H330 setup. ATA temperature comes from normalized `temperature.current`, never the packed SMART `raw.value`; NVMe includes the hottest valid normalized sensor.
 
@@ -239,7 +242,7 @@ Do not resume manual control if restoration fails. Investigate local IPMI access
 
 ## Tuning and validation limits
 
-Edit `FAN_PROFILES`, `EXPECTED_DRIVE_COUNTS`, `AIR_PROFILES`, `DRIVE_PROFILES` and timing constants only after assessing the actual host. All fan profiles deliberately share the temperature safety limits and sensor validity checks. Commit and test local changes, stop the installed service, deploy the reviewed files, validate inputs, and run another supervised trial before enabling the service again. Keep this policy documentation in sync with changed constants. Selecting an existing profile is the only operation that takes effect without a restart.
+Edit `FAN_PROFILES`, `EXPECTED_DRIVE_COUNTS`, `AIR_PROFILES`, `CPU_PROFILE_OVERRIDES`, `DRIVE_PROFILES` and timing constants only after assessing the actual host. `CPU_PROFILE_OVERRIDES` changes only the named presets' CPU curves; the inlet, exhaust and disk limits and all sensor validity checks remain shared. Commit and test local changes, stop the installed service, deploy the reviewed files, validate inputs, and run another supervised trial before enabling the service again. Keep this policy documentation in sync with changed constants. Selecting an existing profile is the only operation that takes effect without a restart.
 
 The original deployment was checked at 23°C inlet with a bounded five-minute workload using 12 CPU workers and 18.75 GiB of read-only disk I/O across 14 drives. The controller raised PWM under load and reduced it afterward. Normal stop, missing CPU temperature, a successful SMART response without temperature, rejected PWM writes and a `SIGSTOP` watchdog recovery were exercised. These hardware fault-injection helpers are intentionally not shipped as ordinary developer tests.
 
