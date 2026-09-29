@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# A manually installed unit in /etc overrides the packaged vendor unit.
+if [ "$1" = install ] && { [ -e /etc/systemd/system/ipmi-fan-control.service ] || [ -L /etc/systemd/system/ipmi-fan-control.service ]; }; then
+    echo 'Remove or relocate the existing /etc/systemd/system/ipmi-fan-control.service after stopping it; it would override the packaged unit.' >&2
+    exit 1
+fi
+
+#DEBHELPER#

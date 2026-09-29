@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py "$@"

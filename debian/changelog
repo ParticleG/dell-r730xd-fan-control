@@ -1,0 +1,14 @@
+ipmi-fan-control (0.1.0-2) bookworm; urgency=medium
+
+  * Install a command for read-only checks and runtime profile selection.
+  * Sample all visible disks without fixed counts and restore automatic
+    control when a previously sampled disk disappears.
+
+ -- ParticleG <particle_g@outlook.com>  Tue, 29 Sep 2026 04:28:56 +0000
+
+ipmi-fan-control (0.1.0-1) bookworm; urgency=medium
+
+  * Package the R730xd fan controller and systemd service.
+  * Leave the service disabled and stopped until the host is validated.
+
+ -- ParticleG <particle_g@outlook.com>  Tue, 29 Sep 2026 00:00:00 +0000

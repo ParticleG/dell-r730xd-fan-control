@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+# Removing a running controller must run its restore path before files vanish.
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl --system stop ipmi-fan-control.service
+fi
+
+#DEBHELPER#

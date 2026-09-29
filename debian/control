@@ -1,0 +1,17 @@
+Source: ipmi-fan-control
+Section: admin
+Priority: optional
+Maintainer: ParticleG <particle_g@outlook.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: ipmi-fan-control
+Architecture: all
+Depends: ${misc:Depends}, python3 (>= 3.11~), ipmitool, smartmontools, util-linux, systemd
+Description: Local IPMI fan control for a Dell PowerEdge R730xd
+ Temperature-aware fan controller for a specific dual-CPU R730xd running
+ Proxmox VE. Reads local IPMI and SMART sensors before switching to manual
+ fan control and restores automatic control when the controller exits.
+ .
+ The service is not enabled or started during package installation.

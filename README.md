@@ -34,7 +34,7 @@ The tests replace command execution with mocks; they do not access IPMI or disks
 
 ## Profiles and runtime commands
 
-Presets share the inlet, exhaust and disk temperature limits, disk requirements and sensor validity checks. `silent` alone uses a later CPU ramp and handoff (60°C / 75°C); all other presets keep 50°C / 70°C. PWM endpoints are:
+Presets share the inlet, exhaust and disk temperature limits and sensor validity checks. `silent` alone uses a later CPU ramp and handoff (60°C / 75°C); all other presets keep 50°C / 70°C. PWM endpoints are:
 
 | Profile | PWM floor | PWM ceiling | Purpose |
 | --- | ---: | ---: | --- |
@@ -46,15 +46,15 @@ Presets share the inlet, exhaust and disk temperature limits, disk requirements 
 
 New presets have software-level checks only, not new hardware thermal validation. A profile name is not a safety or acoustic certification.
 
-With the updated service already running **on PVE**, use these root commands:
+The Debian package installs `/usr/bin/ipmi-fan-control`, a shell launcher that runs the bundled Python controller with `-B` and forwards all options. It does not grant privileges or start the service. With the updated service already running **on PVE**, use these root commands:
 
 ```sh
-python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --get-profile
-python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --set-profile performance
+ipmi-fan-control --get-profile
+ipmi-fan-control --set-profile performance
 # Return to the original policy:
-python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --set-profile balanced
+ipmi-fan-control --set-profile balanced
 # Set and persist the detection interval in seconds (0.5-10):
-python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --set-interval 3
+ipmi-fan-control --set-interval 3
 ```
 
 `--set-profile silent` and `--set-profile quiet` use the same interface, but require assessment of the low-airflow risks above before any hardware trial.
@@ -76,15 +76,9 @@ The systemd unit creates private runtime and persistent directories. A manually 
 
 The authoritative preset endpoints, sensor limits and interval bounds are in [ipmi_fan_control.py](ipmi_fan_control.py). The state files store only the selected profile name and detection interval, not arbitrary editable curves; editing source still requires deployment and a service restart.
 
-`EXPECTED_DRIVE_COUNTS` requires at least:
+There are no minimum HDD, non-NVMe SSD or NVMe counts. Every 60-second SMART sweep rediscovers disks with `lsblk` and requires a usable temperature from every currently visible disk. Hot-added disks join the next sweep and are reported on stderr. If a disk sampled on an earlier sweep disappears, the process exits nonzero and, in control mode, attempts to restore iDRAC automatic control; this also applies if the inventory drops to zero. Each completed JSON status line includes the current `drives.devices` list. A host with no disks on its *first* sweep relies on inlet, exhaust and CPU temperatures and the selected profile's PWM floor.
 
-| Class | Required count |
-| --- | ---: |
-| `hdd` | 10 |
-| `ssd` (non-NVMe; SATA in the validated machine) | 2 |
-| `nvme` | 2 |
-
-Additional discovered disks are also sampled. A missing required class/count, an unreadable disk or a disk without a usable temperature prevents continued manual control. Disks passed through to another OS may no longer meet this host-side requirement.
+This is not a persistent inventory verifier. A disk missing before startup cannot be distinguished from an intentionally absent disk; a replacement reusing the same kernel name between sweeps may not be detected. Compare `--check` inventory against the expected hardware and rely on storage/iDRAC alerts for missing drives. A disk passed through to another OS is likewise invisible to host-side SMART sampling. Any *discovered* disk with an unreadable or unusable temperature still prevents manual control.
 
 The IPMI parser also requires:
 
@@ -127,7 +121,7 @@ The `silent` CPU curve requests its 10% floor through 60°C, then rises linearly
 
 SMART uses automatic device detection. Do not reintroduce a forced `-d scsi` for all SATA disks: that returned success without temperature on the validated H330 setup. ATA temperature comes from normalized `temperature.current`, never the packed SMART `raw.value`; NVMe includes the hottest valid normalized sensor.
 
-Non-NVMe SMART reads use `-n standby`. Sleeping disks are not deliberately spun up to obtain a temperature. If a required temperature is unavailable, the controller hands back to iDRAC rather than treating it as 0°C, silently omitting it or indefinitely reusing an old reading.
+Non-NVMe SMART reads use `-n standby`. Sleeping disks are not deliberately spun up to obtain a temperature. If a discovered disk's temperature is unavailable, the controller hands back to iDRAC rather than treating it as 0°C, silently omitting it or indefinitely reusing an old reading.
 
 ## Failure handling and logs
 
@@ -138,7 +132,7 @@ The supplied [systemd unit](ipmi-fan-control.service) uses:
 - `ExecStopPost` running the automatic-control command under a 10-second timeout, with a further 2-second kill grace period.
 - `TimeoutStopSec=20s`.
 
-A sensor or command failure exits nonzero. The service retries after 30 seconds; this is **not a latched shutdown**. While a required input remains invalid, a retry does not enter manual control. Exceptionally slow but still successful sampling can also exceed the watchdog deadline, so a watchdog event is not by itself proof of a deadlock. Do not feed the watchdog from an unrelated timer that would hide a stalled control loop.
+A sensor or command failure exits nonzero. Losing a previously sampled disk also exits nonzero and attempts to restore automatic control. The service retries after 30 seconds; this is **not a latched shutdown**. While a required sensor remains invalid, a retry does not enter manual control. A retry after disk disappearance, however, has no inventory from the previous process and may accept the smaller inventory as its new baseline. Stop the service and investigate an unexpected disk loss rather than relying on the controller to keep automatic mode across restarts. Exceptionally slow but still successful sampling can also exceed the watchdog deadline, so a watchdog event is not by itself proof of a deadlock. Do not feed the watchdog from an unrelated timer that would hide a stalled control loop.
 
 Normal control-mode exit, `SIGINT` and `SIGTERM` run the program's restore path. `SIGKILL` cannot run that cleanup; systemd provides a separate restore attempt. An unmanaged invocation has no systemd fallback.
 
@@ -146,38 +140,54 @@ Once exit cleanup begins, further `SIGINT` and `SIGTERM` requests are ignored so
 
 Each cycle emits JSON, including the selected `profile`, configured `interval` in seconds, and a millisecond-resolution timestamp. `pwm` is the last successfully commanded percentage, **not a BMC mode/duty readback**. `profile_target_pwm` is the curve's demand; `target_pwm` includes ramping and hysteresis. `fan_rpm` contains measured values sampled before that cycle's write; a speed change can appear in the following sample. Read-only mode reports `pwm: null`. Always consider measured RPM alongside the requested duty, and never overlap controllers or fault-injection runs.
 
+## Build and publish the Debian package
+
+On a Debian/Ubuntu build machine, install the build tools once, then build as a normal user from the repository checkout:
+
+```sh
+sudo apt-get install --no-install-recommends build-essential debhelper dpkg-dev
+dpkg-buildpackage -b -us -uc
+```
+
+The result is `../ipmi-fan-control_0.1.0-2_all.deb` for the version in `debian/changelog`. The package includes the controller at `/opt/ipmi-fan-control/ipmi_fan_control.py`, the `/usr/bin/ipmi-fan-control` command, mocked tests and license, the README under `/usr/share/doc/`, and the unit at `/lib/systemd/system/ipmi-fan-control.service`. Runtime dependencies are declared in `debian/control`; no Python package manager is needed. A first install does not enable or start the service. Upgrades do not restart a running service automatically; stop and disable it first, then repeat validation and a trial before enabling it again.
+
+`.github/workflows/release.yml` runs the mocked tests, builds the `.deb` and checks the installed command on pushes to `main`, pull requests and manual dispatch; those runs upload a CI artifact but do not publish a Release. Pushing a `vX.Y.Z` tag builds and publishes the tested `.deb` and `SHA256SUMS` to GitHub Releases only if `X.Y.Z` matches the upstream part of `debian/changelog` (for example, tag `v0.1.0` for Debian version `0.1.0-2`). The Debian revision is part of the package filename, not the tag. A mismatched or non-semantic `v*` tag fails the build; subsequent releases need a new upstream version and tag. Commit the changelog and code before tagging that commit. GitHub Releases supplies downloadable files, **not** an APT repository. Verify downloaded files with `sha256sum -c SHA256SUMS` in the download directory before transferring them to the host.
+
 ## Install or update on PVE
 
-Transfer the reviewed checkout to the PVE host. **Run the following commands there as root, from that checkout, not on the development desktop.** Stop other fan controllers first. Do not proceed past a failed command or an invalid sensor check.
+Download a reviewed release `.deb` or build one as above, then transfer it to the PVE host. **Run the following commands there as root, not on the development desktop.** Stop other fan controllers first. Begin with iDRAC automatic control active; if uncertain, use the recovery procedure below after stopping all controllers. Do not proceed past a failed command or invalid sensor check.
 
-Begin with iDRAC automatic control active. If its state is uncertain, use the manual recovery procedure below after stopping all controllers.
-
-If updating an existing installation, first disable and stop it so its restore path runs:
+If updating an existing installation, stop and disable it first so its restore path runs:
 
 ```sh
 systemctl disable --now ipmi-fan-control.service
 ```
 
-Install missing dependencies and copy the files. The PVE base system supplies systemd, coreutils and util-linux.
+An older manual installation places its unit at `/etc/systemd/system/ipmi-fan-control.service`, which takes precedence over the packaged unit. The package refuses a **first install** while that file is present. After stopping the old service, back up and relocate that unit before installing; the package replaces the script at the existing `/opt/ipmi-fan-control/` path and leaves the persistent profile/interval settings untouched:
 
 ```sh
-apt-get install --no-install-recommends python3 ipmitool smartmontools
-install -d -m 0755 /opt/ipmi-fan-control
-install -m 0644 ipmi_fan_control.py test_ipmi_fan_control.py LICENSE /opt/ipmi-fan-control/
-install -m 0644 ipmi-fan-control.service /etc/systemd/system/ipmi-fan-control.service
-systemd-analyze verify /etc/systemd/system/ipmi-fan-control.service
+mv -n /etc/systemd/system/ipmi-fan-control.service /root/ipmi-fan-control.service.manual-backup
 systemctl daemon-reload
 ```
 
-Check the real inputs without changing fan settings:
+Run the `mv` only for a manual installation with that unit present. If the backup destination already exists, resolve the conflict instead of overwriting it. Install the release file; replace the version in the example with the downloaded filename:
+
+```sh
+apt install ./ipmi-fan-control_0.1.0-2_all.deb
+systemctl daemon-reload
+systemd-analyze verify /lib/systemd/system/ipmi-fan-control.service
+```
+
+Installation resolves the declared dependencies but does not start manual fan control. Check the real inputs without changing fan settings:
 
 ```sh
 ipmitool -I open mc info
-python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --check
-python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --monitor --duration 120
+ipmi-fan-control --check
+ipmi-fan-control --monitor --duration 120
 ```
 
-Confirm both CPUs, all six fans and every required disk are present. Review the profile against the actual hardware before taking manual control; changing counts solely to conceal failed reads is not a fix.
+Confirm both CPUs and all six fans, and compare `drives.devices` against the intended disk inventory before taking manual control. `--check` cannot detect a disk already missing before its first scan. Review the profile against the actual hardware. Removing the package later does not erase the persistent profile and interval files.
+
 
 ### First controlled trial
 
@@ -197,7 +207,7 @@ systemd-run --unit=ipmi-fan-control-trial --wait --pipe \
   --property=TimeoutStopSec=20s \
   --property=Restart=no \
   '--property=ExecStopPost=/usr/bin/timeout --kill-after=2s 10s /usr/bin/ipmitool -I open raw 0x30 0x30 0x01 0x01' \
-  /usr/bin/python3 -B /opt/ipmi-fan-control/ipmi_fan_control.py --control --profile balanced --duration 540
+  /usr/bin/ipmi-fan-control --control --profile balanced --duration 540
 ```
 
 To abort an active trial from another terminal:
@@ -241,11 +251,11 @@ ipmitool -I open raw 0x30 0x30 0x01 0x01
 ipmitool -I open sdr type Fan
 ```
 
-Do not resume manual control if restoration fails. Investigate local IPMI access and monitor hardware temperatures. To revert a software change, select and test the desired Git revision locally, then repeat the stopped-service update and read-only validation sequence above.
+Do not resume manual control if restoration fails. Investigate local IPMI access and monitor hardware temperatures. To uninstall, stop the service as above, then run `apt remove ipmi-fan-control`; its removal script also attempts a stop if it is still running. Persistent profile and interval selections remain. To revert a software change, install a reviewed earlier `.deb`, then repeat read-only validation and a supervised trial before enabling the service.
 
 ## Tuning and validation limits
 
-Edit `FAN_PROFILES`, `EXPECTED_DRIVE_COUNTS`, `AIR_PROFILES`, `CPU_PROFILE_OVERRIDES`, `DRIVE_PROFILES` and interval bounds only after assessing the actual host. `CPU_PROFILE_OVERRIDES` changes only the named presets' CPU curves; the inlet, exhaust and disk limits and all sensor validity checks remain shared. Commit and test local changes, stop the installed service, deploy the reviewed files, validate inputs, and run another supervised trial before enabling the service again. Keep this policy documentation in sync with changed constants. Selecting an existing profile or setting an interval within the supported range takes effect without a restart.
+Edit `FAN_PROFILES`, `AIR_PROFILES`, `CPU_PROFILE_OVERRIDES`, `DRIVE_PROFILES` and interval bounds only after assessing the actual host. `CPU_PROFILE_OVERRIDES` changes only the named presets' CPU curves; the inlet, exhaust and disk limits and all sensor validity checks remain shared. Commit and test local changes, stop the installed service, build and install the reviewed package, validate inputs, and run another supervised trial before enabling the service again. Keep this policy documentation in sync with changed constants. Selecting an existing profile or setting an interval within the supported range takes effect without a restart.
 
 The original deployment was checked at 23°C inlet with a bounded five-minute workload using 12 CPU workers and 18.75 GiB of read-only disk I/O across 14 drives. The controller raised PWM under load and reduced it afterward. Normal stop, missing CPU temperature, a successful SMART response without temperature, rejected PWM writes and a `SIGSTOP` watchdog recovery were exercised. These hardware fault-injection helpers are intentionally not shipped as ordinary developer tests.
 

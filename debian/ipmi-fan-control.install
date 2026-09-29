@@ -1,0 +1,5 @@
+ipmi_fan_control.py opt/ipmi-fan-control/
+ipmi-fan-control usr/bin/
+test_ipmi_fan_control.py opt/ipmi-fan-control/
+LICENSE opt/ipmi-fan-control/
+ipmi-fan-control.service lib/systemd/system/
