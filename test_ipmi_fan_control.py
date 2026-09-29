@@ -111,6 +111,75 @@ class FanControlTests(unittest.TestCase):
             self.assertEqual(controller.main(), 1)
 
 
+
+class DriveDiscoveryTests(unittest.TestCase):
+    def test_rediscovery_samples_current_hotplug_inventory_without_class_minimums(self):
+        inventories = iter([
+            [{'name': 'sda', 'type': 'disk', 'rota': True},
+             {'name': 'loop0', 'type': 'loop', 'rota': False}],
+            [{'name': 'sda', 'type': 'disk', 'rota': True},
+             {'name': 'sdk', 'type': 'disk', 'rota': False},
+             {'name': 'nvme0n1', 'type': 'disk', 'rota': False}],
+            [{'name': 'nvme0n1', 'type': 'disk', 'rota': False}],
+            [],
+        ])
+        temperatures = {'sda': 40, 'sdk': 45, 'nvme0n1': 55}
+
+        def command(argv, **kwargs):
+            if argv[0] == 'lsblk':
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({'blockdevices': next(inventories)}), '')
+            if argv[0] == '/usr/sbin/smartctl':
+                temp = temperatures[Path(argv[-1]).name]
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({'temperature': {'current': temp}}), '')
+            raise AssertionError(f'Unexpected command: {argv}')
+
+        with (
+            mock.patch.object(controller.subprocess, 'run', side_effect=command),
+            mock.patch.object(controller, 'stable_byid_path', side_effect=lambda path: path),
+        ):
+            summaries = [controller.sample_drive_temperatures() for _ in range(4)]
+
+        self.assertEqual([summary['max_by_profile'] for summary in summaries], [
+            {'hdd': 40},
+            {'hdd': 40, 'ssd': 45, 'nvme': 55},
+            {'nvme': 55},
+            {},
+        ])
+        self.assertEqual([summary['count'] for summary in summaries], [1, 3, 1, 0])
+        self.assertEqual(controller.compute_drive_fan_target(summaries[-1], 'balanced'), 45)
+
+    def test_newly_discovered_disk_without_temperature_rejects_sample(self):
+        devices = [{'name': 'sda', 'type': 'disk', 'rota': True},
+                   {'name': 'nvme0n1', 'type': 'disk', 'rota': False}]
+
+        def command(argv, **kwargs):
+            if argv[0] == 'lsblk':
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({'blockdevices': devices}), '')
+            if argv[0] == '/usr/sbin/smartctl':
+                payload = {'temperature': {'current': 40}} if argv[-1] == '/dev/sda' else {}
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), '')
+            raise AssertionError(f'Unexpected command: {argv}')
+
+        with (
+            mock.patch.object(controller.subprocess, 'run', side_effect=command),
+            mock.patch.object(controller, 'stable_byid_path', side_effect=lambda path: path),
+        ):
+            with self.assertRaisesRegex(controller.SensorError, 'nvme0n1 temperature unavailable'):
+                controller.sample_drive_temperatures()
+
+    def test_invalid_discovery_is_not_mistaken_for_an_empty_server(self):
+        for payload in ({}, {'blockdevices': None}, []):
+            with self.subTest(payload=payload), mock.patch.object(
+                controller.subprocess, 'run',
+                return_value=subprocess.CompletedProcess(['lsblk'], 0, json.dumps(payload), ''),
+            ):
+                with self.assertRaises(controller.SensorError):
+                    controller.discover_drive_devices()
+
+
 class ProfileTests(unittest.TestCase):
     def setUp(self):
         self.resources = contextlib.ExitStack()
@@ -128,7 +197,11 @@ class ProfileTests(unittest.TestCase):
         self.resources.enter_context(mock.patch.object(controller, 'read_all_sensors',
                                                        return_value=(23, 34, 42, 45)))
         self.resources.enter_context(mock.patch.object(controller, 'sample_drive_temperatures',
-            return_value={'max_by_profile': {'hdd': 30, 'ssd': 35, 'nvme': 36}}))
+            return_value=controller.summarize_drive_temperatures([
+                {'name': 'sda', 'profile': 'hdd', 'temp': 30, 'status': 'ok'},
+                {'name': 'sdk', 'profile': 'ssd', 'temp': 35, 'status': 'ok'},
+                {'name': 'nvme0n1', 'profile': 'nvme', 'temp': 36, 'status': 'ok'},
+            ])))
         self.resources.enter_context(mock.patch.object(sys, 'argv', [
             'fan-control', '--control', '--socket', self.endpoint,
             '--state-file', str(self.state), '--interval-file', str(self.interval_state)]))
@@ -339,6 +412,81 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(controller.read_setting(str(self.interval_state), controller.interval_value), 10)
         self.assertTrue(self.automatic)
         self.assertEqual(self.pwm_writes, [])
+
+    def test_empty_drive_inventory_still_uses_air_and_cpu_sensors(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(controller, 'sample_drive_temperatures',
+                              return_value=controller.summarize_drive_temperatures([])),
+            mock.patch.object(sys, 'argv', ['fan-control', '--check',
+                                          '--state-file', str(self.state),
+                                          '--interval-file', str(self.interval_state)]),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(controller.main(), 0)
+        status = json.loads(output.getvalue())
+        self.assertEqual(status['drives']['count'], 0)
+        self.assertEqual(status['profile_target_pwm'], 45)
+        self.assertEqual(status['cpu'], [42, 45])
+        self.assertEqual(self.pwm_writes, [])
+
+    def test_hot_added_drive_is_reported_without_interrupting_control(self):
+        def summary(*names):
+            return controller.summarize_drive_temperatures([
+                {'name': name, 'profile': 'hdd' if name == 'sda' else 'nvme',
+                 'temp': 30, 'status': 'ok'} for name in names
+            ])
+
+        now = [100]
+
+        def advance(listener, timeout, status):
+            now[0] += controller.DRIVE_SAMPLE_SECONDS
+            if now[0] > 160:
+                raise KeyboardInterrupt
+
+        errors = io.StringIO()
+        with (
+            mock.patch.object(controller.time, 'monotonic', side_effect=lambda: now[0]),
+            mock.patch.object(controller, 'sample_drive_temperatures',
+                              side_effect=[summary('sda'), summary('sda', 'nvme0n1')]),
+            mock.patch.object(controller, 'wait_for_control', side_effect=advance),
+            contextlib.redirect_stderr(errors),
+        ):
+            self.assertEqual(controller.main(), 0)
+        self.assertIn('nvme0n1', errors.getvalue())
+        self.assertIn('added', errors.getvalue())
+        self.assertTrue(self.automatic)
+
+    def test_previously_sampled_drive_disappearing_restores_automatic_control(self):
+        def summary(*names):
+            return controller.summarize_drive_temperatures([
+                {'name': name, 'profile': 'hdd' if name == 'sda' else 'nvme',
+                 'temp': 30, 'status': 'ok'} for name in names
+            ])
+
+        for remaining in (('nvme0n1',), ()):
+            with self.subTest(remaining=remaining):
+                now = [100]
+                self.pwm_writes.clear()
+                errors = io.StringIO()
+
+                def advance(listener, timeout, status):
+                    now[0] += controller.DRIVE_SAMPLE_SECONDS
+
+                with (
+                    mock.patch.object(controller.time, 'monotonic',
+                                      side_effect=lambda: now[0]),
+                    mock.patch.object(controller, 'sample_drive_temperatures',
+                                      side_effect=[summary('sda', 'nvme0n1'),
+                                                   summary(*remaining)]),
+                    mock.patch.object(controller, 'wait_for_control', side_effect=advance),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    self.assertEqual(controller.main(), 1)
+                self.assertEqual(self.pwm_writes, [45])
+                self.assertTrue(self.automatic)
+                self.assertIn('sda', errors.getvalue())
+
 
     def test_normal_cooling_uses_every_cycle_despite_sensor_latency(self):
         now = [100]

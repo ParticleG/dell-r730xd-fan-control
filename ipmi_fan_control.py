@@ -6,9 +6,12 @@ Based on https://github.com/greghughespdx/dell-poweredge-fan-control
 Copyright (c) 2026 Greg Hughes. Distributed under the accompanying MIT LICENSE.
 
 The default --check command only reads temperatures and fan status. --control
-explicitly enables manual PWM control. Missing inputs, unhealthy fans and
-thermal limits terminate control and restore the iDRAC automatic policy.
-The systemd unit also restores automatic mode after crashes or watchdog expiry.
+explicitly enables manual PWM control. Every host-visible disk is sampled
+without fixed class counts; a previously sampled disk disappearing fails
+closed. Disks absent before startup require external inventory checks.
+Unusable readings, unhealthy fans and thermal limits terminate control and
+restore the iDRAC automatic policy.
+The systemd unit also attempts to restore automatic mode after crashes or watchdog expiry.
 Neither mechanism can protect against a frozen kernel or an unreachable BMC.
 
 The balanced profile preserves the original 45% floor. Silent and quiet are
@@ -89,7 +92,6 @@ MIN_INTERVAL = 0.5
 MAX_INTERVAL = 10.0
 DRIVE_SAMPLE_SECONDS = 60
 DRIVE_SMART_TIMEOUT = 5
-EXPECTED_DRIVE_COUNTS = {"hdd": 10, "ssd": 2, "nvme": 2}
 
 # (start increasing PWM, return to the iDRAC automatic policy), in Celsius.
 AIR_PROFILES = {"inlet": (26, 32), "exhaust": (38, 50), "cpu": (50, 70)}
@@ -231,8 +233,10 @@ def discover_drive_devices():
         raise SensorError(f"Drive discovery failed: {error}") from error
 
     devices = []
-    counts = dict.fromkeys(EXPECTED_DRIVE_COUNTS, 0)
-    for dev in payload.get("blockdevices", []):
+    blockdevices = payload.get("blockdevices") if isinstance(payload, dict) else None
+    if not isinstance(blockdevices, list):
+        raise SensorError("Drive discovery returned no blockdevices list")
+    for dev in blockdevices:
         name = dev.get("name", "")
         if dev.get("type") != "disk":
             continue
@@ -245,17 +249,12 @@ def discover_drive_devices():
             profile = "ssd"
         else:
             raise SensorError(f"Unknown drive class: {name}")
-        counts[profile] += 1
         devices.append({
             "path": stable_byid_path(kernel_path),
             "name": name,
             "profile": profile,
             "model": dev.get("model") or "unknown",
         })
-    for profile, expected in EXPECTED_DRIVE_COUNTS.items():
-        if counts[profile] < expected:
-            raise SensorError(f"Expected at least {expected} {profile} drives, "
-                              f"found {counts[profile]}")
     return devices
 
 
@@ -297,7 +296,7 @@ def read_drive_temperature(device):
 
 
 def sample_drive_temperatures():
-    """Rediscover each sweep so added/removed disks cannot be silently skipped."""
+    """Rediscover each sweep and sample every currently visible disk."""
     entries = []
     for device in discover_drive_devices():
         reading = read_drive_temperature(device)
@@ -321,8 +320,9 @@ def summarize_drive_temperatures(entries):
 
 
 def compute_drive_fan_target(summary, profile):
-    return max(component_target(temp, DRIVE_PROFILES[kind], kind, profile)
-               for kind, temp in summary["max_by_profile"].items())
+    return max((component_target(temp, DRIVE_PROFILES[kind], kind, profile)
+                for kind, temp in summary["max_by_profile"].items()),
+               default=FAN_PROFILES[profile][0])
 
 
 def private_directory(path, create=False):
@@ -544,7 +544,19 @@ def main():
                 last_cycle_start = cycle_start
             # Never enter manual mode before the first complete valid sample.
             if last_sample is None or cycle_start - last_sample >= DRIVE_SAMPLE_SECONDS:
-                drive_summary = sample_drive_temperatures()
+                sampled = sample_drive_temperatures()
+                if drive_summary is not None:
+                    previous = {drive["name"] for drive in drive_summary["devices"]}
+                    current = {drive["name"] for drive in sampled["devices"]}
+                    removed = previous - current
+                    if removed:
+                        raise SensorError(f"Previously sampled disks disappeared: "
+                                          f"{sorted(removed)}")
+                    if current != previous:
+                        print(f"[INFO] Drive inventory changed: "
+                              f"added={sorted(current - previous)}",
+                              file=sys.stderr, flush=True)
+                drive_summary = sampled
                 last_sample = cycle_start
             inlet, exhaust, temp1, temp2 = read_all_sensors()
             target = max(compute_fan_target(inlet, max(temp1, temp2), exhaust, profile),
