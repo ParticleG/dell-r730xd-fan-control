@@ -34,7 +34,7 @@ The tests replace command execution with mocks; they do not access IPMI or disks
 
 ## Profiles and runtime commands
 
-Presets share the inlet, exhaust and disk temperature limits and sensor validity checks. `silent` alone uses a later CPU ramp and handoff (60°C / 75°C); all other presets keep 50°C / 70°C. PWM endpoints are:
+Presets share the inlet, exhaust and disk temperature limits and sensor validity checks. `silent` alone starts its CPU ramp later (60°C instead of 50°C); every preset now hands back CPU control at 80°C. PWM endpoints are:
 
 | Profile | PWM floor | PWM ceiling | Purpose |
 | --- | ---: | ---: | --- |
@@ -109,15 +109,23 @@ Each component independently requests a linear increase between the selected pro
 
 | Component | Start increasing PWM | Handoff to iDRAC at or above |
 | --- | ---: | ---: |
-| Inlet | 26°C | 32°C |
-| Exhaust | 38°C | 50°C |
-| Hottest CPU (`silent`) | 60°C | 75°C |
-| Hottest CPU (all other profiles) | 50°C | 70°C |
+| Inlet | 26°C | 42°C |
+| Exhaust | 38°C | 70°C |
+| Hottest CPU (`silent`) | 60°C | 80°C |
+| Hottest CPU (all other profiles) | 50°C | 80°C |
 | Hottest HDD | 35°C | 45°C |
 | Hottest non-NVMe SSD | 45°C | 60°C |
-| Hottest NVMe | 50°C | 65°C |
+| Hottest NVMe | 50°C | 70°C |
 
-The `silent` CPU curve requests its 10% floor through 60°C, then rises linearly toward 75% just below 75°C. At 75°C it hands back to iDRAC instead of holding that temperature. This higher handoff threshold is experimental and has not been thermally validated under high load; it does not modify iDRAC warning or critical thresholds. Other components can demand more airflow even with the CPUs below 60°C.
+The `silent` CPU curve requests its 10% floor through 60°C, then rises linearly toward 75% just below 80°C. At 80°C it hands back to iDRAC. This later ramp is experimental and has not been thermally validated under high load. Other components can demand more airflow even with the CPUs below 60°C.
+
+The inlet, exhaust and CPU handoffs equal this host's **currently configured** IPMI upper non-critical (warning) thresholds: 42°C, 70°C and 80°C, respectively. Its corresponding upper critical thresholds are 47°C, 75°C and 85°C. These are observations from `ipmitool -I open sensor`, not a claim about immutable factory defaults: Dell's [iDRAC guide](https://www.dell.com/support/manuals/en-us/poweredge-r730xd/idrac8_2.30.30.30_ug/configuring-warning-threshold-for-inlet-temperature?guid=guid-be5de08e-1ac5-43bb-8e62-7349de3f4d61&lang=en-us) permits changing the inlet warning threshold. Reassess these software constants if the BMC thresholds change.
+
+**Warning thresholds are not safe continuous operating limits.** Dell specifies a [35°C standard inlet maximum](https://www.dell.com/support/manuals/en-us/poweredge-r730xd/r730xd_ompublication/standard-operating-temperature?guid=guid-c5c1a8e6-c380-46ea-a788-604fd8778370&lang=en-us), and [40°C expanded continuous operation](https://www.dell.com/support/manuals/en-us/poweredge-r730xd/r730xd_ompublication/expanded-operating-temperature?guid=guid-e8cdc6ea-0355-4e26-8c90-8fd8741ec068&lang=en-us) only under [hardware restrictions](https://www.dell.com/support/manuals/en-us/poweredge-r730xd/r730xd_ompublication/expanded-operating-temperature-restrictions?guid=guid-c7ed6a84-6734-4315-b167-92b007911598&lang=en-us) excluding unqualified or over-25-W peripheral cards. The installed dual-controller NVMe card's [Oracle specifications](https://docs.oracle.com/en/servers/options/nvme-ssd/f640/user-guide-f640-aic/oracle-flash-accelerator-f640-pcie-card-v3-product-specifications.html) list up to 36 W active write. Thus the 42°C inlet handoff neither enforces the standard range nor establishes eligibility for expanded operation; hardware alerts and iDRAC recovery may come too late to protect unobserved components.
+
+Disk handoffs are host-specific **software warning choices**, not Dell/iDRAC drive thresholds. A [community cooling-monitor example](https://github.com/luckylinux/cooling-failure-protection) uses 45°C HDD, 60°C SSD and 70°C NVMe warnings; no single industry threshold covers every model. The installed Intel [S3500 SATA SSD](https://www.intel.com/content/dam/www/public/us/en/documents/product-specifications/ssd-dc-s3500-spec.pdf) has a 70°C maximum *case* temperature, and the two newer NVMe controllers report a 70°C firmware composite warning / 80°C critical threshold, consistent with the [Oracle F640 specifications](https://docs.oracle.com/en/servers/options/nvme-ssd/f640/user-guide-f640-aic/oracle-flash-accelerator-f640-pcie-card-v3-product-specifications.html). The older Intel P3600 does not report a composite warning threshold; its [70°C case-temperature limit](https://www.intel.com/content/dam/www/public/us/en/documents/product-briefs/intel-ssd-dc-family-for-pcie-brief.pdf) is not interchangeable with a SMART composite reading. The 70°C class handoff is **not** a verified safe limit for that older device. SMART temperatures are swept every 60 seconds, so a brief excursion may precede recovery.
+
+For comparison, the [official Zabbix SMART template](https://www.zabbix.com/integrations/smart) defaults to a 50°C warning for all disks and allows host-specific overrides. That generic alert is not an equipment-specific thermal limit and would already be below this host's normal temperature for the older NVMe drive.
 
 SMART uses automatic device detection. Do not reintroduce a forced `-d scsi` for all SATA disks: that returned success without temperature on the validated H330 setup. ATA temperature comes from normalized `temperature.current`, never the packed SMART `raw.value`; NVMe includes the hottest valid normalized sensor.
 
@@ -149,9 +157,9 @@ sudo apt-get install --no-install-recommends build-essential debhelper dpkg-dev
 dpkg-buildpackage -b -us -uc
 ```
 
-The result is `../ipmi-fan-control_0.1.0-2_all.deb` for the version in `debian/changelog`. The package includes the controller at `/opt/ipmi-fan-control/ipmi_fan_control.py`, the `/usr/bin/ipmi-fan-control` command, mocked tests and license, the README under `/usr/share/doc/`, and the unit at `/lib/systemd/system/ipmi-fan-control.service`. Runtime dependencies are declared in `debian/control`; no Python package manager is needed. A first install does not enable or start the service. Upgrades do not restart a running service automatically; stop and disable it first, then repeat validation and a trial before enabling it again.
+The result is `../ipmi-fan-control_0.1.1-1_all.deb` for the version in `debian/changelog`. The package includes the controller at `/opt/ipmi-fan-control/ipmi_fan_control.py`, the `/usr/bin/ipmi-fan-control` command, mocked tests and license, the README under `/usr/share/doc/`, and the unit at `/lib/systemd/system/ipmi-fan-control.service`. Runtime dependencies are declared in `debian/control`; no Python package manager is needed. A first install does not enable or start the service. Upgrades do not restart a running service automatically; stop and disable it first, then repeat validation and a trial before enabling it again.
 
-`.github/workflows/release.yml` runs the mocked tests, builds the `.deb` and checks the installed command on pushes to `main`, pull requests and manual dispatch; those runs upload a CI artifact but do not publish a Release. Pushing a `vX.Y.Z` tag builds and publishes the tested `.deb` and `SHA256SUMS` to GitHub Releases only if `X.Y.Z` matches the upstream part of `debian/changelog` (for example, tag `v0.1.0` for Debian version `0.1.0-2`). The Debian revision is part of the package filename, not the tag. A mismatched or non-semantic `v*` tag fails the build; subsequent releases need a new upstream version and tag. Commit the changelog and code before tagging that commit. GitHub Releases supplies downloadable files, **not** an APT repository. Verify downloaded files with `sha256sum -c SHA256SUMS` in the download directory before transferring them to the host.
+`.github/workflows/release.yml` runs the mocked tests, builds the `.deb` and checks the installed command on pushes to `main`, pull requests and manual dispatch; those runs upload a CI artifact but do not publish a Release. Pushing a `vX.Y.Z` tag builds and publishes the tested `.deb` and `SHA256SUMS` to GitHub Releases only if `X.Y.Z` matches the upstream part of `debian/changelog` (for example, tag `v0.1.1` for Debian version `0.1.1-1`). The Debian revision is part of the package filename, not the tag. A mismatched or non-semantic `v*` tag fails the build; subsequent releases need a new upstream version and tag. Commit the changelog and code before tagging that commit. GitHub Releases supplies downloadable files, **not** an APT repository. Verify downloaded files with `sha256sum -c SHA256SUMS` in the download directory before transferring them to the host.
 
 ## Install or update on PVE
 
@@ -173,7 +181,7 @@ systemctl daemon-reload
 Run the `mv` only for a manual installation with that unit present. If the backup destination already exists, resolve the conflict instead of overwriting it. Install the release file; replace the version in the example with the downloaded filename:
 
 ```sh
-apt install ./ipmi-fan-control_0.1.0-2_all.deb
+apt install ./ipmi-fan-control_0.1.1-1_all.deb
 systemctl daemon-reload
 systemd-analyze verify /lib/systemd/system/ipmi-fan-control.service
 ```
@@ -259,7 +267,7 @@ Edit `FAN_PROFILES`, `AIR_PROFILES`, `CPU_PROFILE_OVERRIDES`, `DRIVE_PROFILES` a
 
 The original deployment was checked at 23°C inlet with a bounded five-minute workload using 12 CPU workers and 18.75 GiB of read-only disk I/O across 14 drives. The controller raised PWM under load and reduced it afterward. Normal stop, missing CPU temperature, a successful SMART response without temperature, rejected PWM writes and a `SIGSTOP` watchdog recovery were exercised. These hardware fault-injection helpers are intentionally not shipped as ordinary developer tests.
 
-That validation did not establish safety for all-core saturation, full 10Gbps NIC load, high ambient temperatures or every unobservable component. Lower RPM is not a measured reduction in decibels. The included regression tests do not certify thermal safety on another machine.
+That validation did not establish safety for the new 42°C inlet, 70°C exhaust, 80°C CPU or 70°C NVMe handoffs, all-core saturation, full 10Gbps NIC load, high ambient temperatures or every unobservable component. Lower RPM is not a measured reduction in decibels. The included regression tests do not certify thermal safety on another machine.
 
 ## Origin and license
 

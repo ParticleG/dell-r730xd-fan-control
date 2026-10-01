@@ -16,6 +16,11 @@ Neither mechanism can protect against a frozen kernel or an unreachable BMC.
 
 The balanced profile preserves the original 45% floor. Silent and quiet are
 unvalidated low-airflow presets: H330 and X540 temperatures are not exposed.
+The inlet, exhaust, and CPU handoffs match this BMC's current warning
+thresholds, not Dell's supported operating-temperature limits. A 42C inlet
+handoff exceeds Dell's continuous operating range. Disk handoffs are
+software-policy warnings, not universal drive firmware limits.
+
 Profile and detection-interval selections persist locally; runtime changes
 need no service restart.
 """
@@ -94,9 +99,10 @@ DRIVE_SAMPLE_SECONDS = 60
 DRIVE_SMART_TIMEOUT = 5
 
 # (start increasing PWM, return to the iDRAC automatic policy), in Celsius.
-AIR_PROFILES = {"inlet": (26, 32), "exhaust": (38, 50), "cpu": (50, 70)}
-CPU_PROFILE_OVERRIDES = {"silent": (60, 75)}
-DRIVE_PROFILES = {"hdd": (35, 45), "ssd": (45, 60), "nvme": (50, 65)}
+# Air/CPU handoffs match this host's current IPMI upper non-critical thresholds.
+AIR_PROFILES = {"inlet": (26, 42), "exhaust": (38, 70), "cpu": (50, 80)}
+CPU_PROFILE_OVERRIDES = {"silent": (60, 80)}
+DRIVE_PROFILES = {"hdd": (35, 45), "ssd": (45, 60), "nvme": (50, 70)}
 
 
 def notify_watchdog():

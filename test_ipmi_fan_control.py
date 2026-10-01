@@ -221,23 +221,46 @@ class ProfileTests(unittest.TestCase):
         return subprocess.CompletedProcess(command, 0, '', '')
 
     def test_profiles_request_distinct_duties_for_the_same_cpu_load(self):
-        for profile, expected in {'silent': 10, 'quiet': 50, 'balanced': 60,
-                                  'performance': 82.5, 'full-speed': 100}.items():
+        for profile, expected in {'silent': 10, 'quiet': 25 + 50 / 3, 'balanced': 55,
+                                  'performance': 65 + 35 / 3, 'full-speed': 100}.items():
             with self.subTest(profile=profile):
-                self.assertEqual(controller.compute_fan_target(23, 60, 34, profile), expected)
+                self.assertAlmostEqual(
+                    controller.compute_fan_target(23, 60, 34, profile), expected)
 
-    def test_silent_cpu_ramp_crosses_the_legacy_handoff(self):
-        self.assertAlmostEqual(controller.compute_fan_target(23, 70, 34, 'silent'), 160 / 3)
+    def test_silent_cpu_ramp_continues_past_the_old_handoff(self):
+        self.assertAlmostEqual(controller.compute_fan_target(23, 70, 34, 'silent'), 42.5)
 
     def test_extreme_profiles_do_not_bypass_air_or_disk_handoff(self):
-        for profile, cpu_limit in (('silent', 75), ('full-speed', 70)):
+        for profile in ('silent', 'full-speed'):
             with self.subTest(profile=profile):
-                for inlet, cpu, exhaust in ((32, 45, 34), (23, 45, 50), (23, cpu_limit, 34)):
+                for inlet, cpu, exhaust in ((42, 45, 34), (23, 45, 70), (23, 80, 34)):
                     with self.subTest(inlet=inlet, cpu=cpu, exhaust=exhaust):
                         with self.assertRaises(controller.SensorError):
                             controller.compute_fan_target(inlet, cpu, exhaust, profile)
-                with self.assertRaises(controller.SensorError):
-                    controller.compute_drive_fan_target({'max_by_profile': {'hdd': 45}}, profile)
+                for drive_class, limit in (('hdd', 45), ('ssd', 60), ('nvme', 70)):
+                    with self.subTest(drive_class=drive_class):
+                        with self.assertRaises(controller.SensorError):
+                            controller.compute_drive_fan_target(
+                                {'max_by_profile': {drive_class: limit}}, profile)
+
+    def test_balanced_demand_rises_through_the_degree_before_each_handoff(self):
+        for (inlet, cpu, exhaust), expected in (
+            ((41, 45, 34), 73.125),
+            ((23, 45, 69), 74.0625),
+            ((23, 79, 34), 74),
+        ):
+            with self.subTest(inlet=inlet, cpu=cpu, exhaust=exhaust):
+                self.assertAlmostEqual(
+                    controller.compute_fan_target(inlet, cpu, exhaust, 'balanced'),
+                    expected)
+        for drive_class, value, expected in (
+            ('hdd', 44, 72), ('ssd', 59, 73), ('nvme', 69, 73.5)
+        ):
+            with self.subTest(drive_class=drive_class):
+                self.assertAlmostEqual(
+                    controller.compute_drive_fan_target(
+                        {'max_by_profile': {drive_class: value}}, 'balanced'),
+                    expected)
 
     def test_failed_state_replacement_preserves_previous_selection(self):
         controller.save_setting(str(self.state), 'balanced')
@@ -338,8 +361,8 @@ class ProfileTests(unittest.TestCase):
     def test_switch_finishes_at_target_then_restores_normal_ramping(self):
         now = [100]
         cpu = [45]
-        actions = iter([(101, 'silent', 63.1), (103, None, 63.1), (106, None, 63.1),
-                        (109, None, 63), (112, None, 60)])
+        actions = iter([(101, 'silent', 64.1), (103, None, 64.1), (106, None, 64.1),
+                        (109, None, 64), (112, None, 60)])
 
         def advance(listener, timeout, status):
             try:
@@ -490,7 +513,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_normal_cooling_uses_every_cycle_despite_sensor_latency(self):
         now = [100]
-        temperatures = iter([69, 45, 45])
+        temperatures = iter([79, 45, 45])
         sample_starts = []
 
         def sensors():

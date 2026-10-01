@@ -1,3 +1,10 @@
+ipmi-fan-control (0.1.1-1) bookworm; urgency=medium
+
+  * Hand back air and CPU control at this host's current IPMI warning values.
+  * Use a 70 C NVMe software warning; document drive-specific thermal risks.
+
+ -- ParticleG <particle_g@outlook.com>  Thu, 01 Oct 2026 06:48:57 +0000
+
 ipmi-fan-control (0.1.0-2) bookworm; urgency=medium
 
   * Install a command for read-only checks and runtime profile selection.
